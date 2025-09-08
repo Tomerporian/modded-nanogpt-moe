@@ -356,7 +356,7 @@ dist.init_process_group(backend='nccl')
 ddp_rank = int(os.environ['RANK'])
 ddp_local_rank = int(os.environ['LOCAL_RANK'])
 ddp_world_size = int(os.environ['WORLD_SIZE'])
-device = f'cuda:{ddp_local_rank}'
+device = 'cuda:0'  # Each process only sees one GPU with SLURM
 torch.cuda.set_device(device)
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
@@ -387,7 +387,7 @@ if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
 # here we wrap model into DDP container
-model = DDP(model, device_ids=[ddp_local_rank])
+model = DDP(model, device_ids=[0])
 raw_model = model.module # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 

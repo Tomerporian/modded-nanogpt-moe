@@ -212,19 +212,32 @@ def hash_select(token_ids, num_experts, null_expert_bias=0.0):
         selected_prob = selected_prob / (selected_prob + null_expert_bias)
     return selected_expert, routing_weights, selected_prob
 
+def diff_routing(logits, k):
+    probs = logits.softmax(dim=-1)
+    z_max = torch.max(logits, dim=-1, keepdim=True).values
+    exp_z = torch.exp(logits - z_max)
+    num_experts = exp_z.shape[-1]
+    kth_smallest_idx = num_experts - k
+    m_exp_z = torch.kthvalue(exp_z, k=kth_smallest_idx, dim=-1, keepdim=True).values
+    topk_exp_z = F.relu(exp_z - m_exp_z)
+    topk_weights = topk_exp_z / (topk_exp_z.sum(dim=-1, keepdim=True) + 1e-8)
+    # Get indices of top-k for compatibility
+    _, topk_idx = torch.topk(topk_weights, k, dim=-1)
+    return topk_idx, probs, topk_weights
+
 class MoE(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.num_experts = 16
-        self.top_k       = 1
+        self.num_experts = 8
+        self.top_k       = 2
         assert 1 <= self.top_k <= self.num_experts, "`k` must be in [1, #experts]"
-        self.router_type  = 'hash'
+        self.router_type  = 'diff'
 
-        assert self.router_type in ('hash', 'switch')
+        assert self.router_type in ('hash', 'switch', 'diff')
 
         self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
         
-        if self.router_type == 'switch':
+        if self.router_type != 'hash':
             self.router  = nn.Linear(config.n_embd, self.num_experts, bias=False)
 
 
@@ -233,6 +246,11 @@ class MoE(nn.Module):
         if self.router_type == "switch":
             logits = self.router(x)
             topk_idx, probs, gate = switch_topk(logits, self.top_k)
+        elif self.router_type == "diff":
+            logits = self.router(x)
+            topk_idx, probs, gate = diff_routing(logits, self.top_k)
+            # Extract only top-k weights to match switch format
+            gate = torch.gather(gate, dim=-1, index=topk_idx)
         elif self.router_type == "hash":
             topk_idx, probs, gate = hash_select(token_idx, self.num_experts)
             gate = gate.to(x.dtype)
@@ -245,13 +263,8 @@ class MoE(nn.Module):
         y_flat  = torch.zeros_like(x_flat)
 
         probs_flat = probs.reshape(BT, -1)
-        gate_flat = gate.reshape(BT, self.top_k)
-        idx_flat  = topk_idx.reshape(BT, self.top_k)
-
-        #eps       = 1e-9
-        #token_H   = -(probs_flat * (probs_flat + eps).log()).sum(-1)      # (B·T,)
-        #router_H  = token_H.mean() / math.log(float(self.num_experts))  # scalar ∈ [0,1]
-
+        gate_flat = gate.reshape(BT, self.top_k)  # Now always (BT, k)
+        idx_flat = topk_idx.reshape(BT, self.top_k)        
         for expert_id in range(self.num_experts):
             sel_mask = (idx_flat == expert_id)
             token_rows, which_k = torch.nonzero(sel_mask, as_tuple=True)
@@ -275,7 +288,7 @@ class MoE(nn.Module):
                 token_H = -(probs_flat * (probs_flat + eps).log()).sum(-1)
                 router_entropy = token_H.mean() / math.log(float(self.num_experts))
             # Switch paper:  L_aux = E * <load,prob>
-            if self.router_type == "switch":
+            if self.router_type != "hash":
                 probs_mean = logits.softmax(dim=-1).reshape(-1, self.num_experts).mean(0)
                 aux = self.num_experts * (frac * probs_mean).sum()
             elif self.router_type == "hash":
@@ -455,7 +468,7 @@ class Hyperparameters:
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 32 # batch size, in sequences, per device
+    device_batch_size : int = 16 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 4578 # number of iterations to run
     warmup_iters : int = 0
@@ -473,7 +486,7 @@ dist.init_process_group(backend='nccl')
 ddp_rank = int(os.environ['RANK'])
 ddp_local_rank = int(os.environ['LOCAL_RANK'])
 ddp_world_size = int(os.environ['WORLD_SIZE'])
-device = f'cuda:{ddp_local_rank}'
+device = 'cuda:0'  # Each process only sees one GPU with SLURM
 torch.cuda.set_device(device)
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
@@ -504,7 +517,7 @@ if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
 # here we wrap model into DDP container
-model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
+model = DDP(model, device_ids=[0], find_unused_parameters=True)
 raw_model = model.module # always contains the "raw" unwrapped model
 num_experts = raw_model.transformer.h[0].mlp.num_experts
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)

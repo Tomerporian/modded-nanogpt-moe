@@ -436,38 +436,82 @@ class DistributedDataLoader:
         self.files = sorted(glob.glob(filename_pattern))
         assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
 
-        # load and validate all data shards, count number of tokens in total
+        # determine file format based on path
+        if 'fineweb10B' in filename_pattern:
+            self.file_format = 'fineweb'
+            self.header_size = 256 * 4  # 256 int32 values
+        elif 'tokenized_owt' in filename_pattern:
+            self.file_format = 'openwebtext'
+            self.header_size = 0  # no header
+        else:
+            raise ValueError(f"Unknown dataset format for pattern: {filename_pattern}")
+
+        # validate all data shards and get lengths
+        self.shard_lengths = []
         ntok_total = 0
+        
         for fname in self.files:
-            shard_ntok = _peek_data_shard(fname)
-            assert shard_ntok >= num_processes * B * T + 1
+            if self.file_format == 'fineweb':
+                # peek to get the number of tokens and validate format
+                shard_ntok = _peek_data_shard(fname)
+            else:  # openwebtext
+                # calculate tokens from file size
+                import os
+                file_size = os.path.getsize(fname)
+                shard_ntok = file_size // 2  # each token is 2 bytes (uint16)
+            
+            self.shard_lengths.append(shard_ntok)
             ntok_total += int(shard_ntok)
+        
         self.ntok_total = ntok_total
 
-        # kick things off
-        self.reset()
-
-    def reset(self):
-        self.current_shard = 0
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
-
-    def advance(self): # advance to next data shard
-        self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+        # create cumulative lengths for sampling across shards (use int64 to avoid overflow)
+        self.cumulative_lengths = []
+        cumsum = 0
+        for length in self.shard_lengths:
+            cumsum += int(length)  # ensure we're working with Python int, not numpy int
+            self.cumulative_lengths.append(cumsum)
 
     def next_batch(self):
         B = self.B
         T = self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        # advance current position and load next shard if necessary
-        self.current_position += B * T * self.num_processes
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.advance()
+        
+        # Sample all random positions at once (like Diff_topK_nanoMoE)
+        random_positions = torch.randint(0, self.ntok_total - T, (B,))
+        
+        # Map positions to (shard_idx, pos_in_shard) for each sequence
+        shard_info = []
+        for pos in random_positions:
+            pos = pos.item()
+            # Find which shard contains this position
+            shard_idx = 0
+            for i, cum_len in enumerate(self.cumulative_lengths):
+                if pos < cum_len:
+                    shard_idx = i
+                    break
+            
+            # Calculate position within the shard
+            if shard_idx == 0:
+                pos_in_shard = pos
+            else:
+                pos_in_shard = pos - self.cumulative_lengths[shard_idx - 1]
+            
+            shard_info.append((shard_idx, pos_in_shard))
+        
+        # Extract sequences (similar to Diff_topK_nanoMoE list comprehension style)
+        x_list = []
+        y_list = []
+        
+        for shard_idx, pos_in_shard in shard_info:
+            # Recreate memmap to avoid memory leak (like Diff_topK_nanoMoE)
+            tokens = np.memmap(self.files[shard_idx], dtype=np.uint16, mode='r', offset=self.header_size)
+            seq = tokens[pos_in_shard:pos_in_shard + T + 1]
+            x_list.append(torch.from_numpy(seq[:T].astype(np.int64)))      # inputs
+            y_list.append(torch.from_numpy(seq[1:T+1].astype(np.int64)))   # targets
+        
+        x = torch.stack(x_list)
+        y = torch.stack(y_list)
+        
         return x.cuda(), y.cuda()
 
 
@@ -720,85 +764,55 @@ if master_process:
     with open(os.path.join(args.output, 'args.yaml'), 'w') as f:
         f.write(args_text)
     # init wandb
-    wandb_run = wandb.init(project=args.wandb_project, name=run_id, config={
-        'data': {
-            'input_bin': args.input_bin,
-            'input_val_bin': args.input_val_bin,  
-            'val_tokens': args.val_tokens,
-        },
-        'training': {
-            'batch_size_total': args.batch_size,
-            'device_batch_size': args.device_batch_size,
-            'sequence_length': args.sequence_length,
-            'num_iterations': args.num_iterations,
-            'accumulation_steps': train_accumulation_steps,
-            'val_steps': val_steps,
-            'save_every': args.save_every,
-        },
-        'scheduler': {
-            'type': 'linear_warmup_constant_linear_warmdown',
-            'warmup_iters': args.warmup_iters,
-            'warmdown_iters': args.warmdown_iters,
-        },
-        'optimizers': {
-            'embed': {
-                'type': 'AdamW',
-                'lr': optimizer1.param_groups[0]['lr'],
-                'betas': tuple(optimizer1.param_groups[0]['betas']),
-                'fused': bool(optimizer1.param_groups[0].get('fused', False)),
-                'weight_decay': args.weight_decay,
-            },
-            'head': {
-                'type': 'AdamW',
-                'lr': optimizer2.param_groups[0]['lr'],
-                'betas': tuple(optimizer2.param_groups[0]['betas']),
-                'fused': bool(optimizer2.param_groups[0].get('fused', False)),
-                'weight_decay': args.weight_decay,
-            },
-            'muon_blocks': {
-                'type': 'Muon',
-                'lr': optimizer3.param_groups[0]['lr'],
-                'momentum': optimizer3.defaults.get('momentum', None),
-                'nesterov': optimizer3.defaults.get('nesterov', None),
-                'backend': optimizer3.defaults.get('backend', None),
-                'backend_steps': optimizer3.defaults.get('backend_steps', None),
-            }
-        },
-        'model': {
-            'vocab_size': args.vocab_size,
-            'n_layer': raw_model.config.n_layer,
-            'n_head': raw_model.config.n_head,
-            'n_embd': raw_model.config.n_embd,
-            'num_experts': num_experts,
-            'router_type': raw_model.transformer.h[0].mlp.router_type,
-            'router_top_k': raw_model.transformer.h[0].mlp.top_k,
-        },
-        'loss': {
-            'type': 'cross_entropy',
-            'ignore_index': -1,
-            'aux_coeff_train': args.aux_coeff_train,
-            'aux_coeff_val': args.aux_coeff_val,
-        },
-        'dist': {
-            'world_size': ddp_world_size,
-            'rank': ddp_rank,
-            'local_rank': ddp_local_rank,
-        },
-        'precision': {
-            'amp_dtype': 'bfloat16',
-        },
-        'torch': {
-            'compile': True,
-            'attention_backend': 'cudnn_sdp',
-        },
+    
+    # Create config from args and add computed/runtime information
+    config = vars(args).copy()  # Convert args to dict
+    config.update({
+        'train_accumulation_steps': train_accumulation_steps,
+        'val_steps': val_steps,
+        'num_experts': num_experts,
+        'ddp_world_size': ddp_world_size,
+        'ddp_rank': ddp_rank,
+        'ddp_local_rank': ddp_local_rank,
+        'model_n_layer': raw_model.config.n_layer,
+        'model_n_head': raw_model.config.n_head,
+        'model_n_embd': raw_model.config.n_embd,
+        'model_router_type': raw_model.transformer.h[0].mlp.router_type,
+        'model_router_top_k': raw_model.transformer.h[0].mlp.top_k,
+        'optimizer_embed_lr': optimizer1.param_groups[0]['lr'],
+        'optimizer_embed_betas': tuple(optimizer1.param_groups[0]['betas']),
+        'optimizer_embed_fused': bool(optimizer1.param_groups[0].get('fused', False)),
+        'optimizer_head_lr': optimizer2.param_groups[0]['lr'],
+        'optimizer_head_betas': tuple(optimizer2.param_groups[0]['betas']),
+        'optimizer_head_fused': bool(optimizer2.param_groups[0].get('fused', False)),
+        'optimizer_muon_lr': optimizer3.param_groups[0]['lr'],
+        'optimizer_muon_momentum': optimizer3.defaults.get('momentum', None),
+        'optimizer_muon_nesterov': optimizer3.defaults.get('nesterov', None),
+        'optimizer_muon_backend': optimizer3.defaults.get('backend', None),
+        'optimizer_muon_backend_steps': optimizer3.defaults.get('backend_steps', None),
+        'amp_dtype': 'bfloat16',
+        'torch_compile': True,
+        'attention_backend': 'cudnn_sdp',
     })
+    
+    run_name = os.path.basename(args.output)
+    # group seeds
+    # group_args = "+".join([x for x in run_name.split("+")[1:] if 'see=' not in x])
+    # group_base = run_name.split("+")[0][13:]
+    # group = group_base + group_args
+    
+    # tags = [x for x in os.path.basename(args.output).split("+")[1:] if len(x) > 0]
+    
+    wandb_run = wandb.init(project=args.wandb_project, 
+                           name=run_name, 
+                        #    tags=tags,
+                           config=config)
 
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
 t0 = time.time()
 # begin training
-train_loader.reset()
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
@@ -816,7 +830,6 @@ for step in range(args.num_iterations + 1):
         training_time_ms += 1000 * (time.time() - t0)
         # run validation batches
         model.eval()
-        val_loader.reset()
         val_loss = 0.0
         val_router_entropy = torch.tensor(0.0, device=device)
         val_expert_balance = torch.zeros(num_experts, device=device)

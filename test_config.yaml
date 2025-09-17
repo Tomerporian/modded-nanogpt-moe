@@ -1,0 +1,29 @@
+job_details:
+  name: test_multiple
+  output_dir: /home/ycarmon/no_backup/users/sachter/models/modded_moe/test_multiple
+
+parameters:
+  LIST_DATASETS:
+    - input_bin: ["/home/ycarmon/no_backup/users/sachter/data/fineweb10B/fineweb_train_*.bin"]
+      input_val_bin: ["/home/ycarmon/no_backup/users/sachter/data/fineweb10B/fineweb_val_*.bin"]
+    - input_bin: ["/home/ycarmon/no_backup/users/sachter/data/openwebtext/tokenized_owt2/train.bin"]
+      input_val_bin: ["/home/ycarmon/no_backup/users/sachter/data/openwebtext/tokenized_owt2/val.bin"]
+  
+  n_layer: [6]
+  n_head: [4]
+  n_embd: [32]
+  num_experts: [4]
+  top_k: [2]
+  router_type: ['switch']
+
+  batch_size: [8]
+  device_batch_size: [4]
+  sequence_length: [64]
+  num_iterations: [10]
+  val_loss_every: [5]
+  val_tokens: [10240]
+  save_every: [5]
+
+  wandb_project: ['modded-nanogpt-moe-test']
+
+  seed: [1000, 2000]

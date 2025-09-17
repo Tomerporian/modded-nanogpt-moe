@@ -8,9 +8,18 @@ import time
 from dataclasses import dataclass
 import math
 import gc
+import argparse
+import yaml
+import logging
+import warnings
+import random
 
 import numpy as np
 import torch
+
+# Suppress specific PyTorch Inductor warnings
+warnings.filterwarnings("ignore", message="Online softmax is disabled on the fly since Inductor decides to split the reduction")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch._inductor.lowering")
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -33,7 +42,7 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
     zero even beyond the point where the iteration no longer converges all the way to one everywhere
     on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
+    where S' is diagonal with S_{ii}' \\ sim Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     assert len(G.shape) == 2
@@ -226,12 +235,12 @@ def diff_routing(logits, k):
     return topk_idx, probs, topk_weights
 
 class MoE(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, num_experts=8, top_k=2, router_type='diff'):
         super().__init__()
-        self.num_experts = 8
-        self.top_k       = 2
+        self.num_experts = num_experts
+        self.top_k       = top_k
         assert 1 <= self.top_k <= self.num_experts, "`k` must be in [1, #experts]"
-        self.router_type  = 'diff'
+        self.router_type  = router_type
 
         assert self.router_type in ('hash', 'switch', 'diff')
 
@@ -301,10 +310,10 @@ class MoE(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, num_experts=8, top_k=2, router_type='diff'):
         super().__init__()
         self.attn = CausalSelfAttention(config)
-        self.mlp = MoE(config)
+        self.mlp = MoE(config, num_experts=num_experts, top_k=top_k, router_type=router_type)
 
     def forward(self, x, token_idx=None):
         x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
@@ -321,6 +330,9 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
+    num_experts : int = 8
+    top_k : int = 2
+    router_type : str = 'diff'
 
 class GPT(nn.Module):
 
@@ -330,7 +342,7 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, num_experts=config.num_experts, top_k=config.top_k, router_type=config.router_type) for _ in range(config.n_layer)]),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_()
@@ -392,10 +404,10 @@ def _peek_data_shard(filename):
         # first read the header, which is 256 int32 integers (4 bytes each)
         header = np.frombuffer(f.read(256*4), dtype=np.int32)
     if header[0] != 20240520:
-        print("ERROR: magic number mismatch in the data .bin file!")
-        print("---> HINT: Are you passing in a correct file with --input_bin?")
-        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
-        print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+        logging.info("ERROR: magic number mismatch in the data .bin file!")
+        logging.info("---> HINT: Are you passing in a correct file with --input_bin?")
+        logging.info("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
+        logging.info("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
         exit(1)
     assert header[1] == 1, "unsupported version"
     ntok = header[2] # number of tokens (claimed)
@@ -458,27 +470,133 @@ class DistributedDataLoader:
             self.advance()
         return x.cuda(), y.cuda()
 
+
+def setup_default_logging(default_level=logging.INFO, log_path=''):
+    formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d,%H:%M:%S')
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logging.root.addHandler(console_handler)
+    logging.root.setLevel(default_level)
+    if log_path:
+        file_handler = logging.handlers.RotatingFileHandler(log_path, maxBytes=(1024 ** 2 * 2), backupCount=3)
+        file_formatter = logging.Formatter("%(asctime)s - %(name)20s: [%(levelname)8s] - %(message)s")
+        file_handler.setFormatter(file_formatter)
+        logging.root.addHandler(file_handler)
+
+setup_default_logging()
+
+# -----------------------------------------------------------------------------
+# Argument parsing
+
+# The first arg parser parses out only the --config argument, this argument is used to
+# load a yaml file containing key-values that override the defaults for the main parser below
+config_parser = parser = argparse.ArgumentParser(description='Training Config', add_help=False)
+parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
+                    help='YAML config file specifying default arguments')
+
+parser = argparse.ArgumentParser(description='NanoGPT MoE Training')
+
+# Data parameters
+group = parser.add_argument_group('Data parameters')
+group.add_argument('--input-bin', default='data/fineweb10B/fineweb_train_*.bin', type=str,
+                   help='input .bin to train on')
+group.add_argument('--input-val-bin', default='data/fineweb10B/fineweb_val_*.bin', type=str,
+                   help='input .bin to eval validation loss on')
+
+# Model parameters
+group = parser.add_argument_group('Model parameters')
+group.add_argument('--vocab-size', default=50304, type=int,
+                   help='vocabulary size')
+group.add_argument('--n-layer', default=12, type=int,
+                   help='number of transformer layers')
+group.add_argument('--n-head', default=6, type=int,
+                   help='number of attention heads')
+group.add_argument('--n-embd', default=768, type=int,
+                   help='embedding dimension')
+group.add_argument('--num-experts', default=8, type=int,
+                   help='number of MoE experts')
+group.add_argument('--top-k', default=2, type=int,
+                   help='top-k experts to use')
+group.add_argument('--router-type', default='diff', type=str, choices=['switch', 'diff', 'hash'],
+                   help='router type for MoE')
+
+# Optimization parameters
+group = parser.add_argument_group('Optimization parameters')
+group.add_argument('--batch-size', default=8*64, type=int,
+                   help='batch size, in sequences, across all devices')
+group.add_argument('--device-batch-size', default=16, type=int,
+                   help='batch size, in sequences, per device')
+group.add_argument('--sequence-length', default=1024, type=int,
+                   help='sequence length, in tokens')
+group.add_argument('--num-iterations', default=4578, type=int,
+                   help='number of iterations to run')
+group.add_argument('--warmup-iters', default=0, type=int,
+                   help='number of warmup iterations')
+group.add_argument('--warmdown-iters', default=1308, type=int,
+                   help='number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule')
+group.add_argument('--weight-decay', default=0.0, type=float,
+                   help='weight decay')
+
+# Learning rate parameters
+group = parser.add_argument_group('Learning rate parameters')
+group.add_argument('--lr-embed', default=0.3, type=float,
+                   help='learning rate for embedding layer')
+group.add_argument('--lr-head', default=0.002, type=float,
+                   help='learning rate for head layer')
+group.add_argument('--lr-muon', default=0.02, type=float,
+                   help='learning rate for muon optimizer (transformer blocks)')
+group.add_argument('--momentum', default=0.95, type=float,
+                   help='momentum for muon optimizer')
+
+# Evaluation and logging parameters
+group = parser.add_argument_group('Evaluation and logging parameters')
+group.add_argument('--val-loss-every', default=125, type=int,
+                   help='every how many steps to evaluate val loss? 0 for only at the end')
+group.add_argument('--val-tokens', default=10485760, type=int,
+                   help='how many tokens of validation data? it\'s important to keep this fixed for consistent comparisons')
+group.add_argument('--save-every', default=0, type=int,
+                   help='every how many steps to save the checkpoint? 0 for only at the end')
+group.add_argument('--wandb-project', default='modded-nanogpt-moe', type=str,
+                   help='wandb project name')
+group.add_argument('--output', default='logs', type=str,
+                   help='output directory for logs and checkpoints')
+
+# Loss parameters
+group = parser.add_argument_group('Loss parameters')
+group.add_argument('--aux-coeff-train', default=0.0, type=float,
+                   help='auxiliary loss coefficient for training')
+group.add_argument('--aux-coeff-val', default=0.0, type=float,
+                   help='auxiliary loss coefficient for validation')
+
+# Misc:
+group = parser.add_argument_group('Run config')
+group.add_argument('--device_0', action='store_true', default=False,
+                   help='Always use device=0')
+group.add_argument('--seed', type=int, default=42,
+                   help='random seed (default: 42)')
+
+def _parse_args():
+    # Do we have a config file to parse?
+    args_config, remaining = config_parser.parse_known_args()
+    if args_config.config:
+        with open(args_config.config, 'r') as f:
+            cfg = yaml.safe_load(f)
+            parser.set_defaults(**cfg)
+
+    # The main arg parser parses the rest of the args, the usual
+    # defaults will have been overridden if config file specified.
+    args = parser.parse_args(remaining)
+
+    # Cache the args as a text string to save them in the output dir later
+    args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
+
+    return args, args_text
+
 # -----------------------------------------------------------------------------
 # int main
 
-@dataclass
-class Hyperparameters:
-    # data hyperparams
-    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
-    # optimization hyperparams
-    batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 16 # batch size, in sequences, per device
-    sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 4578 # number of iterations to run
-    warmup_iters : int = 0
-    warmdown_iters : int = 1308 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
-    weight_decay : float = 0.0
-    # evaluation and logging hyperparams
-    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-args = Hyperparameters()
+# Parse command line arguments and config file  
+args, args_text = _parse_args()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
@@ -486,9 +604,27 @@ dist.init_process_group(backend='nccl')
 ddp_rank = int(os.environ['RANK'])
 ddp_local_rank = int(os.environ['LOCAL_RANK'])
 ddp_world_size = int(os.environ['WORLD_SIZE'])
-device = 'cuda:0'  # Each process only sees one GPU with SLURM
+if args.device_0:
+    device = 'cuda:0'  # Each process only sees one GPU with SLURM
+else:
+    device = f'cuda:{ddp_local_rank}'
+
 torch.cuda.set_device(device)
-print(f"using device: {device}")
+logging.info(f"using device: {device}")
+
+torch.manual_seed(args.seed + ddp_rank)
+np.random.seed(args.seed + ddp_rank)
+random.seed(args.seed + ddp_rank)
+
+# TODO consider making it more deterministic - but make it slower
+# torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
+# torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+
+# torch.use_deterministic_algorithms(True)
+# torch.backends.cudnn.deterministic = True
+# torch.backends.cudnn.benchmark = False
+
+
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
 # convenience variables
@@ -504,20 +640,30 @@ train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
 val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 if master_process:
-    print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+    logging.info(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+    logging.info(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 x, y = train_loader.next_batch()
 
-# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
-# this originates from Karpathy's experiments.
-num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+# create model using parsed arguments
+model = GPT(GPTConfig(
+    vocab_size=args.vocab_size, 
+    n_layer=args.n_layer, 
+    n_head=args.n_head, 
+    n_embd=args.n_embd,
+    num_experts=args.num_experts,
+    top_k=args.top_k,
+    router_type=args.router_type
+))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
 # here we wrap model into DDP container
-model = DDP(model, device_ids=[0], find_unused_parameters=True)
+if args.device_0:
+    model = DDP(model, device_ids=[0], find_unused_parameters=True)
+else:
+    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
+    
 raw_model = model.module # always contains the "raw" unwrapped model
 num_experts = raw_model.transformer.h[0].mlp.num_experts
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
@@ -532,10 +678,10 @@ enable_math_sdp(False)
 # init the optimizer(s)
 all_h_params = list(raw_model.transformer.h.parameters())
 muon_params = all_h_params
-optimizer1 = torch.optim.AdamW([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
-optimizer2 = torch.optim.AdamW([raw_model.lm_head.weight], lr=0.002, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
+optimizer1 = torch.optim.AdamW([raw_model.transformer.wte.weight], lr=args.lr_embed, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
+optimizer2 = torch.optim.AdamW([raw_model.lm_head.weight], lr=args.lr_head, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
 
-optimizer3 = Muon(muon_params,                                     lr=0.02,  momentum=0.95)
+optimizer3 = Muon(muon_params, lr=args.lr_muon, momentum=args.momentum)
 optimizers = [optimizer1, optimizer2, optimizer3]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
@@ -555,9 +701,8 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 # begin logging
 if master_process:
     run_id = str(uuid.uuid4())
-    logdir = 'logs/%s/' % run_id
-    os.makedirs(logdir, exist_ok=True)
-    logfile = 'logs/%s.txt' % run_id
+    os.makedirs(args.output, exist_ok=True)
+    logfile = os.path.join(args.output, f'{run_id}.txt')
     # create the log file
     with open(logfile, "w") as f:
         # begin the log by printing this file (the Python code)
@@ -571,12 +716,14 @@ if master_process:
         result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         f.write(f'{result.stdout}\n')
         f.write('='*100 + '\n')
+    # save args to file
+    with open(os.path.join(args.output, 'args.yaml'), 'w') as f:
+        f.write(args_text)
     # init wandb
-    wandb_project = "modded-nanogpt-moe"
-    wandb_run = wandb.init(project=wandb_project, name=run_id, config={
+    wandb_run = wandb.init(project=args.wandb_project, name=run_id, config={
         'data': {
             'input_bin': args.input_bin,
-            'input_val_bin': args.input_val_bin,
+            'input_val_bin': args.input_val_bin,  
             'val_tokens': args.val_tokens,
         },
         'training': {
@@ -618,7 +765,7 @@ if master_process:
             }
         },
         'model': {
-            'vocab_size': num_vocab,
+            'vocab_size': args.vocab_size,
             'n_layer': raw_model.config.n_layer,
             'n_head': raw_model.config.n_head,
             'n_embd': raw_model.config.n_embd,
@@ -629,8 +776,8 @@ if master_process:
         'loss': {
             'type': 'cross_entropy',
             'ignore_index': -1,
-            'aux_coeff_train': 0.0,
-            'aux_coeff_val': 0.0,
+            'aux_coeff_train': args.aux_coeff_train,
+            'aux_coeff_val': args.aux_coeff_val,
         },
         'dist': {
             'world_size': ddp_world_size,
@@ -681,7 +828,7 @@ for step in range(args.num_iterations + 1):
             x_val, y_val = val_loader.next_batch()
             with torch.no_grad():
                 with ctx:
-                    _, loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(x_val, y_val, return_logits=False, aux_coeff=0.0)
+                    _, loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(x_val, y_val, return_logits=False, aux_coeff=args.aux_coeff_val)
                     val_loss += loss.detach()
                     val_router_entropy = val_router_entropy + router_entropy.detach()
                     val_expert_balance = val_expert_balance + expert_balance.detach()
@@ -701,7 +848,7 @@ for step in range(args.num_iterations + 1):
         dist.all_reduce(val_layer_expert_balance, op=dist.ReduceOp.AVG)
         # log val loss to console and to logfile
         if master_process:
-            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+            logging.info(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
             with open(logfile, "a") as f:
                 f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
         # compute router grad norms (CE and AUX separately) occasionally at validation interval
@@ -778,7 +925,7 @@ for step in range(args.num_iterations + 1):
         training_time_ms += 1000 * (time.time() - t0)
         # save the state of the training process
         log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+        torch.save(log, os.path.join(args.output, f'state_step{step:06d}.pt'))
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -801,7 +948,7 @@ for step in range(args.num_iterations + 1):
     for i in range(1, train_accumulation_steps+1):
         # forward pass
         with ctx:
-            _, loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(x, y, return_logits=False, aux_coeff=0.0)
+            _, loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(x, y, return_logits=False, aux_coeff=args.aux_coeff_train)
             train_loss = loss.detach()
             router_entropy_sum = router_entropy_sum + router_entropy.detach()
             expert_balance_sum = expert_balance_sum + expert_balance.detach()
@@ -817,7 +964,7 @@ for step in range(args.num_iterations + 1):
             loss.backward() # just sync on the last step
     for n, p in model.named_parameters():
         if p.grad is None:
-            print(n)
+            logging.info(n)
     for p in model.parameters():
         p.grad /= train_accumulation_steps
 
@@ -852,7 +999,7 @@ for step in range(args.num_iterations + 1):
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process:
         approx_time = training_time_ms + 1000 * (time.time() - t0)
-        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        logging.info(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         with open(logfile, "a") as f:
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
         # wandb logging
@@ -873,7 +1020,7 @@ for step in range(args.num_iterations + 1):
         wandb.log(wandb_log, step=step+1)
 
 if master_process:
-    print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    logging.info(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
     try:
         wandb.finish()
     except Exception:

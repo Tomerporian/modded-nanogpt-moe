@@ -589,6 +589,8 @@ group.add_argument('--warmdown-iters', default=1308, type=int,
                    help='number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule')
 group.add_argument('--weight-decay', default=0.0, type=float,
                    help='weight decay')
+group.add_argument('--use_adamw_opt3', action='store_true', default=False,
+                   help='use AdamW instead of Muon for transformer blocks')
 
 # Learning rate parameters
 group = parser.add_argument_group('Learning rate parameters')
@@ -730,11 +732,13 @@ enable_math_sdp(False)
 
 # init the optimizer(s)
 all_h_params = list(raw_model.transformer.h.parameters())
-muon_params = all_h_params
 optimizer1 = torch.optim.AdamW([raw_model.transformer.wte.weight], lr=args.lr_embed, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
 optimizer2 = torch.optim.AdamW([raw_model.lm_head.weight], lr=args.lr_head, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
 
-optimizer3 = Muon(muon_params, lr=args.lr_muon, momentum=args.momentum)
+if args.use_adamw_opt3:    
+    optimizer3 = torch.optim.AdamW(all_h_params, lr=6e-4, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
+else:
+    optimizer3 = Muon(all_h_params, lr=args.lr_muon, momentum=args.momentum)
 optimizers = [optimizer1, optimizer2, optimizer3]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):

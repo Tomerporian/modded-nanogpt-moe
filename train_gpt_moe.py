@@ -466,11 +466,17 @@ class DistributedDataLoader:
         self.ntok_total = ntok_total
 
         # create cumulative lengths for sampling across shards (use int64 to avoid overflow)
+        # subtract T from each shard length to ensure we never sample too close to the end
         self.cumulative_lengths = []
         cumsum = 0
         for length in self.shard_lengths:
-            cumsum += int(length)  # ensure we're working with Python int, not numpy int
+            # Ensure we have at least T+1 tokens available for sampling
+            effective_length = max(0, int(length) - self.T)
+            cumsum += effective_length
             self.cumulative_lengths.append(cumsum)
+
+        # Update total tokens to reflect the effective sampling space
+        self.ntok_total = cumsum
 
     def next_batch(self):
         B = self.B
@@ -495,6 +501,9 @@ class DistributedDataLoader:
                 pos_in_shard = pos
             else:
                 pos_in_shard = pos - self.cumulative_lengths[shard_idx - 1]
+
+            # Note: pos_in_shard is now guaranteed to be valid since we excluded
+            # the last T tokens from each shard during cumulative length calculation
             
             shard_info.append((shard_idx, pos_in_shard))
         

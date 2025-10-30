@@ -27,6 +27,9 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
 
+# Import Megatron dataloader for indexed datasets
+from megatron_indexed_dataset import MegatronDataLoader
+
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
@@ -456,9 +459,15 @@ class DistributedDataLoader:
         if 'fineweb10B' in filename_pattern:
             self.file_format = 'fineweb'
             self.header_size = 256 * 4  # 256 int32 values
+            self.dtype = np.uint16
         elif 'tokenized_owt' in filename_pattern:
             self.file_format = 'openwebtext'
             self.header_size = 0  # no header
+            self.dtype = np.uint16
+        elif 'tokenized_c4' in filename_pattern:
+            self.file_format = 'c4'
+            self.header_size = 0  # no header
+            self.dtype = np.uint8
         else:
             raise ValueError(f"Unknown dataset format for pattern: {filename_pattern}")
 
@@ -470,12 +479,14 @@ class DistributedDataLoader:
             if self.file_format == 'fineweb':
                 # peek to get the number of tokens and validate format
                 shard_ntok = _peek_data_shard(fname)
-            else:  # openwebtext
+            else:  # openwebtext or c4
                 # calculate tokens from file size
                 import os
                 file_size = os.path.getsize(fname)
-                shard_ntok = file_size // 2  # each token is 2 bytes (uint16)
-            
+                # token size depends on dtype
+                token_size = np.dtype(self.dtype).itemsize
+                shard_ntok = file_size // token_size
+
             self.shard_lengths.append(shard_ntok)
             ntok_total += int(shard_ntok)
         
@@ -529,15 +540,81 @@ class DistributedDataLoader:
         
         for shard_idx, pos_in_shard in shard_info:
             # Recreate memmap to avoid memory leak (like Diff_topK_nanoMoE)
-            tokens = np.memmap(self.files[shard_idx], dtype=np.uint16, mode='r', offset=self.header_size)
+            tokens = np.memmap(self.files[shard_idx], dtype=self.dtype, mode='r', offset=self.header_size)
             seq = tokens[pos_in_shard:pos_in_shard + T + 1]
             x_list.append(torch.from_numpy(seq[:T].astype(np.int64)))      # inputs
             y_list.append(torch.from_numpy(seq[1:T+1].astype(np.int64)))   # targets
         
         x = torch.stack(x_list)
         y = torch.stack(y_list)
-        
+
         return x.cuda(), y.cuda()
+
+
+def is_megatron_dataset(path_pattern):
+    """
+    Detect if the path refers to a Megatron indexed dataset.
+
+    Returns True if:
+    - Path has no wildcards (not a glob pattern)
+    - Corresponding .idx file exists
+    """
+    # If there are wildcards, it's a multi-file dataset (fineweb/owt style)
+    if '*' in path_pattern or '?' in path_pattern:
+        return False
+
+    # Check if .idx file exists (Megatron format)
+    # Handle both cases: path ends with .bin or not
+    if path_pattern.endswith('.bin'):
+        idx_path = path_pattern[:-4] + '.idx'
+    else:
+        idx_path = path_pattern + '.idx'
+
+    return os.path.exists(idx_path)
+
+
+def create_dataloader(path_pattern, B, T, ddp_rank, ddp_world_size, split='train'):
+    """
+    Create appropriate dataloader based on dataset format.
+
+    - Megatron indexed datasets (.idx/.bin): Use MegatronDataLoader with split support
+    - Multi-file datasets (*.bin): Use DistributedDataLoader
+
+    Args:
+        path_pattern: Path to dataset (with wildcards for multi-file, or path for indexed)
+        B: Batch size
+        T: Sequence length
+        ddp_rank: DDP rank
+        ddp_world_size: Number of DDP processes
+        split: For Megatron datasets, which split to use ('train', 'val', 'test')
+    """
+    if is_megatron_dataset(path_pattern):
+        # Remove .bin extension if present for Megatron loader
+        if path_pattern.endswith('.bin'):
+            path_pattern = path_pattern[:-4]
+
+        if ddp_rank == 0:
+            logging.info(f"Using MegatronDataLoader for indexed dataset: {path_pattern}, split: {split}")
+
+        return MegatronDataLoader(
+            dataset_path=path_pattern,
+            B=B,
+            T=T,
+            process_rank=ddp_rank,
+            num_processes=ddp_world_size,
+            split=split
+        )
+    else:
+        if ddp_rank == 0:
+            logging.info(f"Using DistributedDataLoader for multi-file dataset: {path_pattern}")
+
+        return DistributedDataLoader(
+            filename_pattern=path_pattern,
+            B=B,
+            T=T,
+            process_rank=ddp_rank,
+            num_processes=ddp_world_size
+        )
 
 
 def setup_default_logging(default_level=logging.INFO, log_path=''):
@@ -710,11 +787,18 @@ assert args.batch_size % (B * ddp_world_size) == 0
 train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 
 # load tokens
-train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+train_loader = create_dataloader(args.input_bin, B, T, ddp_rank, ddp_world_size, split='train')
+val_loader = create_dataloader(args.input_val_bin, B, T, ddp_rank, ddp_world_size, split='val')
 if master_process:
-    logging.info(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-    logging.info(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+    # Log dataset info - handle both loader types
+    if hasattr(train_loader, 'ntok_total'):
+        # DistributedDataLoader
+        logging.info(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+        logging.info(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+    else:
+        # MegatronDataLoader
+        logging.info(f"Training DataLoader: total number of tokens: {train_loader.total_tokens}")
+        logging.info(f"Validation DataLoader: total number of tokens: {val_loader.total_tokens}")
 x, y = train_loader.next_batch()
 
 # create model using parsed arguments

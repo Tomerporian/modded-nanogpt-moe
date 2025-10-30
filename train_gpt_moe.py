@@ -250,7 +250,7 @@ class MoE(nn.Module):
             self.router  = nn.Linear(config.n_embd, self.num_experts, bias=False)
 
 
-    def forward(self, x, token_idx=None):
+    def forward(self, x, token_idx=None, return_expert_assignments=False):
 
         if self.router_type == "switch":
             logits = self.router(x)
@@ -303,7 +303,10 @@ class MoE(nn.Module):
             else:
                 raise ValueError(f"unknown routing type: {self.router_type}")
 
-        return y, aux, router_entropy, frac
+        if return_expert_assignments:
+            return y, aux, router_entropy, frac, topk_idx.view_as(x[:, :, :self.top_k])
+        else:
+            return y, aux, router_entropy, frac
 
 
 class Block(nn.Module):
@@ -313,11 +316,16 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.mlp = MoE(config, num_experts=num_experts, top_k=top_k, router_type=router_type)
 
-    def forward(self, x, token_idx=None):
+    def forward(self, x, token_idx=None, return_expert_assignments=False):
         x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
-        mlp_out, aux, router_entropy, expert_balance = self.mlp(F.rms_norm(x, (x.size(-1),)), token_idx)
-        x = x + mlp_out
-        return x, aux, router_entropy, expert_balance
+        if return_expert_assignments:
+            mlp_out, aux, router_entropy, expert_balance, expert_assignments = self.mlp(F.rms_norm(x, (x.size(-1),)), token_idx, return_expert_assignments=True)
+            x = x + mlp_out
+            return x, aux, router_entropy, expert_balance, expert_assignments
+        else:
+            mlp_out, aux, router_entropy, expert_balance = self.mlp(F.rms_norm(x, (x.size(-1),)), token_idx)
+            x = x + mlp_out
+            return x, aux, router_entropy, expert_balance
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
@@ -345,7 +353,7 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_()
 
-    def forward(self, idx, targets=None, return_logits=True, aux_coeff=0.0):
+    def forward(self, idx, targets=None, return_logits=True, aux_coeff=0.0, return_expert_assignments=False):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -355,8 +363,13 @@ class GPT(nn.Module):
         total_expert_balance = None
         per_layer_router_entropy = []
         per_layer_expert_balance = []
+        all_layer_expert_assignments = []
         for block in self.transformer.h:
-            x, aux, router_entropy, expert_balance = block(x, idx)
+            if return_expert_assignments:
+                x, aux, router_entropy, expert_balance, expert_assignments = block(x, idx, return_expert_assignments=True)
+                all_layer_expert_assignments.append(expert_assignments)
+            else:
+                x, aux, router_entropy, expert_balance = block(x, idx)
             total_aux = total_aux + aux
             total_router_entropy = total_router_entropy + router_entropy
             if total_expert_balance is None:
@@ -391,7 +404,12 @@ class GPT(nn.Module):
         if not return_logits:
             logits = None
 
-        return logits, loss, ce_loss, total_aux, avg_router_entropy, avg_expert_balance, layer_router_entropy, layer_expert_balance
+        if return_expert_assignments:
+            # Stack assignments: shape (n_layers, batch, seq_len, top_k)
+            stacked_assignments = torch.stack(all_layer_expert_assignments, dim=0)
+            return logits, loss, ce_loss, total_aux, avg_router_entropy, avg_expert_balance, layer_router_entropy, layer_expert_balance, stacked_assignments
+        else:
+            return logits, loss, ce_loss, total_aux, avg_router_entropy, avg_expert_balance, layer_router_entropy, layer_expert_balance
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -609,6 +627,8 @@ group.add_argument('--val-tokens', default=10485760, type=int,
                    help='how many tokens of validation data? it\'s important to keep this fixed for consistent comparisons')
 group.add_argument('--save-every', default=0, type=int,
                    help='every how many steps to save the checkpoint? 0 for only at the end')
+group.add_argument('--n-tracked-seq', default=100, type=int,
+                   help='number of sequences to track for expert assignment changes (0 to disable tracking)')
 group.add_argument('--wandb-project', default='modded-nanogpt-moe', type=str,
                    help='wandb project name')
 group.add_argument('--output', default='logs', type=str,
@@ -819,6 +839,36 @@ if master_process:
                         #    tags=tags,
                            config=config)
 
+# Sample fixed sequences for expert assignment tracking
+if master_process and args.n_tracked_seq > 0:
+    # Sample sequences for tracking expert assignments over time
+    tracking_sequences = []
+    for _ in range(args.n_tracked_seq):
+        x_sample, _ = val_loader.next_batch()
+        tracking_sequences.append(x_sample[0:1])  # Take first sequence from batch
+    tracking_x = torch.cat(tracking_sequences, dim=0).cuda()  # Shape: (n_tracked_seq, T)
+    # Store previous expert assignments for comparison
+    prev_expert_assignments = None  # Will be set on first validation
+else:
+    tracking_x = None
+    prev_expert_assignments = None
+
+# Sample specific tokens for matrix visualization
+if master_process and tracking_x is not None:
+    # Sample 5 random token positions from the tracked sequences
+    torch.manual_seed(args.seed)  # For reproducibility
+    random.seed(args.seed)
+    
+    tracked_token_positions = []
+    for i in range(5):
+        seq_idx = random.randint(0, tracking_x.shape[0] - 1)
+        token_idx = random.randint(0, tracking_x.shape[1] - 1)
+        tracked_token_positions.append((seq_idx, token_idx))
+        token_id = tracking_x[seq_idx, token_idx].item()
+        logging.info(f"Tracking token #{i}: seq={seq_idx}, pos={token_idx}, token_id={token_id}")
+else:
+    tracked_token_positions = None
+
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -924,12 +974,115 @@ for step in range(args.num_iterations + 1):
         # zero out any probe grads
         model.zero_grad(set_to_none=True)
         gc.collect()
+        
+        # Expert assignment tracking
+        topk_change_percentages = {}  # Dict to store changes for each k value
+        if master_process and tracking_x is not None:
+            model.eval()
+            with torch.no_grad():
+                with ctx:
+                    # Get current expert assignments for tracking sequences
+                    _, _, _, _, _, _, _, _, current_assignments = model(tracking_x, return_logits=False, aux_coeff=0.0, return_expert_assignments=True)
+                    # current_assignments shape: (n_layers, 100, seq_len, top_k)
+                    
+                    if prev_expert_assignments is not None:
+                        # Compare with previous assignments
+                        for layer_idx in range(current_assignments.shape[0]):
+                            # Loop over expert positions (1st, 2nd, ..., top_k-th)
+                            for pos in range(current_assignments.shape[3]):
+                                k = pos + 1  # Convert 0-indexed to 1-indexed for logging
+                                if k not in topk_change_percentages:
+                                    topk_change_percentages[k] = []
+                                
+                                # Check if the expert at position 'pos' changed
+                                curr_expert_at_pos = current_assignments[layer_idx, :, :, pos]  # (100, seq_len)
+                                prev_expert_at_pos = prev_expert_assignments[layer_idx, :, :, pos]
+                                pos_changes = (curr_expert_at_pos != prev_expert_at_pos).float()
+                                
+                                pos_change_pct = pos_changes.mean().item()
+                                topk_change_percentages[k].append(pos_change_pct)
+                    else:
+                        # First validation - initialize with zeros
+                        for k in range(1, current_assignments.shape[3] + 1):
+                            topk_change_percentages[k] = [0.0] * current_assignments.shape[0]
+                    
+                    # Store current assignments for next comparison
+                    prev_expert_assignments = current_assignments.clone()
+        
+        # Single token matrix tracking for wandb visualization
+        if master_process and tracked_token_positions is not None and tracking_x is not None:
+            model.eval()
+            with torch.no_grad():
+                with ctx:
+                    # Get expert assignments for all tracked sequences
+                    _, _, _, _, _, _, _, _, all_assignments = model(tracking_x, return_logits=False, aux_coeff=0.0, return_expert_assignments=True)
+                    # all_assignments shape: (n_layers, n_tracked_seq, seq_len, top_k)
+                    
+                    # Create matrices for each tracked token
+                    for token_idx, (seq_idx, pos_idx) in enumerate(tracked_token_positions):
+                        # Create matrix: rows = experts (0-7), cols = layers
+                        n_layers = all_assignments.shape[0]
+                        matrix = torch.zeros((num_experts, n_layers), dtype=torch.float32)
+                        
+                        # Fill matrix with expert assignments for this specific token
+                        for layer_idx in range(n_layers):
+                            # Get top-k experts chosen for this token in this layer
+                            chosen_experts = all_assignments[layer_idx, seq_idx, pos_idx, :]  # shape: (top_k,)
+                            # Mark chosen experts as 1
+                            for expert_id in chosen_experts:
+                                matrix[expert_id.item(), layer_idx] = 1.0
+                        
+                        # Log matrix as wandb Table for slider visualization
+                        token_id = tracking_x[seq_idx, pos_idx].item()
+                        matrix_data = matrix.cpu().numpy()
+                        
+                        # Create wandb Table with proper column/row labels
+                        columns = [f"Layer_{i}" for i in range(n_layers)]
+                        rows = [f"Expert_{i}" for i in range(num_experts)]
+                        
+                        # Convert matrix to list of lists for wandb
+                        matrix_list = [[float(matrix_data[row, col]) for col in range(n_layers)] for row in range(num_experts)]
+                        
+                        # Create wandb Image from matrix for visualization
+                        import matplotlib.pyplot as plt
+                        import matplotlib
+                        matplotlib.use('Agg')  # Non-interactive backend
+                        
+                        fig, ax = plt.subplots(figsize=(n_layers, num_experts))
+                        im = ax.imshow(matrix_data, cmap='Blues', aspect='auto')
+                        
+                        # Set labels
+                        ax.set_xticks(range(n_layers))
+                        ax.set_xticklabels(columns)
+                        ax.set_yticks(range(num_experts))
+                        ax.set_yticklabels(rows)
+                        
+                        # Add text annotations
+                        for i in range(num_experts):
+                            for j in range(n_layers):
+                                text = ax.text(j, i, f'{matrix_data[i, j]:.0f}',
+                                             ha="center", va="center", color="red" if matrix_data[i, j] > 0.5 else "black")
+                        
+                        ax.set_title(f'Token {token_idx} (ID: {token_id}) Expert Selection')
+                        ax.set_xlabel('Layers')
+                        ax.set_ylabel('Experts')
+                        plt.tight_layout()
+                        
+                        wandb.log({
+                            f"token_matrix/token_{token_idx}_id_{token_id}": wandb.Image(fig)
+                        }, step=step)
+                        
+                        plt.close(fig)
+        
         # log to wandb
         if master_process:
             wandb_log_extra = {}
             for li in range(raw_model.config.n_layer):
                 wandb_log_extra[f'Router Grad Norms (CE)/Layer {li}'] = float(ce_router_layer_grad_norms[li].item())
                 wandb_log_extra[f'Router Grad Norms (AUX)/Layer {li}'] = float(aux_router_layer_grad_norms[li].item())
+                # Add expert assignment change percentages for all k values
+                for k in topk_change_percentages:
+                    wandb_log_extra[f'track_tokens/layer_{li}/top{k}_change'] = float(topk_change_percentages[k][li])
             wandb.log(wandb_log_extra, step=step)
         # now also log the earlier val metrics
         if master_process:

@@ -1061,6 +1061,7 @@ for step in range(args.num_iterations + 1):
         
         # Expert assignment tracking
         topk_change_percentages = {}  # Dict to store changes for each k value
+        any_topk_changed_percentages = []
         if master_process and tracking_x is not None:
             model.eval()
             with torch.no_grad():
@@ -1068,6 +1069,7 @@ for step in range(args.num_iterations + 1):
                     # Get current expert assignments for tracking sequences
                     _, _, _, _, _, _, _, _, current_assignments = model(tracking_x, return_logits=False, aux_coeff=0.0, return_expert_assignments=True)
                     # current_assignments shape: (n_layers, 100, seq_len, top_k)
+                    sorted_curr_assignments = current_assignments.clone().sort(dim=-1)[0]
                     
                     if prev_expert_assignments is not None:
                         # Compare with previous assignments
@@ -1085,13 +1087,18 @@ for step in range(args.num_iterations + 1):
                                 
                                 pos_change_pct = pos_changes.mean().item()
                                 topk_change_percentages[k].append(pos_change_pct)
+                            
+                            any_topk_changed = (sorted_prev_assignments[layer_idx, :, :, :] != sorted_curr_assignments[layer_idx, :, :, :]).sum(dim=-1).type(torch.bool)
+                            any_topk_changed_percentages.append(any_topk_changed.float().mean().item())
                     else:
                         # First validation - initialize with zeros
                         for k in range(1, current_assignments.shape[3] + 1):
                             topk_change_percentages[k] = [0.0] * current_assignments.shape[0]
+                        any_topk_changed_percentages = [0.0] * current_assignments.shape[0]
                     
                     # Store current assignments for next comparison
                     prev_expert_assignments = current_assignments.clone()
+                    sorted_prev_assignments = sorted_curr_assignments.clone()
         
         # Single token matrix tracking for wandb visualization
         if master_process and tracked_token_positions is not None and tracking_x is not None:
@@ -1167,6 +1174,9 @@ for step in range(args.num_iterations + 1):
                 # Add expert assignment change percentages for all k values
                 for k in topk_change_percentages:
                     wandb_log_extra[f'track_tokens/layer_{li}/top{k}_change'] = float(topk_change_percentages[k][li])
+                    
+                wandb_log_extra[f'track_tokens/layer_{li}/chosen_changed'] = float(any_topk_changed_percentages[li])
+                
             wandb.log(wandb_log_extra, step=step)
         # now also log the earlier val metrics
         if master_process:

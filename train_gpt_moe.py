@@ -238,19 +238,27 @@ def diff_routing(logits, k):
     return topk_idx, probs, gate
 
 class MoE(nn.Module):
-    def __init__(self, config, num_experts=8, top_k=2, router_type='diff'):
+    def __init__(self, config, num_experts=8, top_k=2, router_type='diff', router_depth=1):
         super().__init__()
         self.num_experts = num_experts
         self.top_k       = top_k
         assert 1 <= self.top_k <= self.num_experts, "`k` must be in [1, #experts]"
         self.router_type  = router_type
+        self.router_depth = router_depth
 
         assert self.router_type in ('hash', 'switch', 'diff')
 
         self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
         
         if self.router_type != 'hash':
-            self.router  = nn.Linear(config.n_embd, self.num_experts, bias=False)
+            layers = []
+            for _ in range(router_depth - 1):
+                layers.append(nn.Linear(config.n_embd, config.n_embd, bias=False))
+                layers.append(nn.GELU())
+            layers.append(nn.Linear(config.n_embd, self.num_experts, bias=False))
+            self.router = nn.Sequential(*layers)
+        else:
+            self.router = None
 
 
     def forward(self, x, token_idx=None, return_expert_assignments=False):
@@ -314,10 +322,10 @@ class MoE(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config, num_experts=8, top_k=2, router_type='diff'):
+    def __init__(self, config, num_experts=8, top_k=2, router_type='diff', router_depth=1):
         super().__init__()
         self.attn = CausalSelfAttention(config)
-        self.mlp = MoE(config, num_experts=num_experts, top_k=top_k, router_type=router_type)
+        self.mlp = MoE(config, num_experts=num_experts, top_k=top_k, router_type=router_type, router_depth=router_depth)
 
     def forward(self, x, token_idx=None, return_expert_assignments=False):
         x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
@@ -342,6 +350,7 @@ class GPTConfig:
     num_experts : int = 8
     top_k : int = 2
     router_type : str = 'diff'
+    router_depth : int = 1
 
 class GPT(nn.Module):
 
@@ -351,7 +360,16 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            h = nn.ModuleList([Block(config, num_experts=config.num_experts, top_k=config.top_k, router_type=config.router_type) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([
+                Block(
+                    config,
+                    num_experts=config.num_experts,
+                    top_k=config.top_k,
+                    router_type=config.router_type,
+                    router_depth=config.router_depth
+                )
+                for _ in range(config.n_layer)
+            ]),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_()
@@ -665,6 +683,8 @@ group.add_argument('--top-k', default=2, type=int,
                    help='top-k experts to use')
 group.add_argument('--router-type', default='diff', type=str, choices=['switch', 'diff', 'hash'],
                    help='router type for MoE')
+group.add_argument('--router-depth', default=1, type=int,
+                   help='number of layers in the router MLP for non-hash routing (hidden dim == input dim)')
 
 # Optimization parameters
 group = parser.add_argument_group('Optimization parameters')
@@ -809,7 +829,8 @@ model = GPT(GPTConfig(
     n_embd=args.n_embd,
     num_experts=args.num_experts,
     top_k=args.top_k,
-    router_type=args.router_type
+    router_type=args.router_type,
+    router_depth=args.router_depth
 ))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
@@ -894,6 +915,7 @@ if master_process:
         'model_n_embd': raw_model.config.n_embd,
         'model_router_type': raw_model.transformer.h[0].mlp.router_type,
         'model_router_top_k': raw_model.transformer.h[0].mlp.top_k,
+        'model_router_depth': raw_model.transformer.h[0].mlp.router_depth,
         'optimizer_embed_lr': optimizer1.param_groups[0]['lr'],
         'optimizer_embed_betas': tuple(optimizer1.param_groups[0]['betas']),
         'optimizer_embed_fused': bool(optimizer1.param_groups[0].get('fused', False)),
@@ -1031,7 +1053,7 @@ for step in range(args.num_iterations + 1):
         ce_router_layer_grad_norms = []
         for li in range(raw_model.config.n_layer):
             if raw_model.transformer.h[li].mlp.router_type != 'hash':
-                p = raw_model.transformer.h[li].mlp.router.weight
+                p = raw_model.transformer.h[li].mlp.router[-1].weight
                 gnorm = p.grad.detach().float().norm(2) if p.grad is not None else torch.tensor(0.0, device=device)
                 ce_router_layer_grad_norms.append(gnorm)
             else:
@@ -1048,7 +1070,7 @@ for step in range(args.num_iterations + 1):
         aux_router_layer_grad_norms = []
         for li in range(raw_model.config.n_layer):
             if raw_model.transformer.h[li].mlp.router_type != 'hash':
-                p = raw_model.transformer.h[li].mlp.router.weight
+                p = raw_model.transformer.h[li].mlp.router[-1].weight
                 gnorm = p.grad.detach().float().norm(2) if p.grad is not None else torch.tensor(0.0, device=device)
                 aux_router_layer_grad_norms.append(gnorm)
             else:

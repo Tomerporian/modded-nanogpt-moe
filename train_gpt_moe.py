@@ -1294,6 +1294,10 @@ for step in range(args.num_iterations + 1):
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
         sched.step()
+    # capture the current learning rates after scheduler updates
+    current_embed_lr = optimizers[0].param_groups[0]['lr']
+    current_head_lr = optimizers[1].param_groups[0]['lr']
+    current_blocks_lr = optimizers[2].param_groups[0]['lr']
     # null the gradients
     model.zero_grad(set_to_none=True)
     # --------------- TRAINING SECTION END -------------------
@@ -1312,6 +1316,9 @@ for step in range(args.num_iterations + 1):
             'train/grad_norm': float(grad_norm.item()),
             'train/step_time_ms': float(approx_time),
             'train/step_avg_ms': float(approx_time/timed_steps),
+            'lr/embed': float(current_embed_lr),
+            'lr/head': float(current_head_lr),
+            'lr/blocks': float(current_blocks_lr),
         }
         for i_exp in range(num_experts):
             wandb_log[f'train/expert_balance/{i_exp}'] = float(expert_balance_avg[i_exp].item())

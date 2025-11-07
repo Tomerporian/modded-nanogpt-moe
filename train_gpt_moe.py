@@ -13,6 +13,7 @@ import yaml
 import logging
 import warnings
 import random
+import re
 
 import numpy as np
 import torch
@@ -649,6 +650,27 @@ def setup_default_logging(default_level=logging.INFO, log_path=''):
 
 setup_default_logging()
 
+_CKPT_REGEX = re.compile(r'state_step(\d+)\.pt')
+
+def find_latest_checkpoint(output_dir):
+    """
+    Returns the path to the checkpoint with the highest step number in `output_dir`,
+    or None if no checkpoints are found.
+    """
+    pattern = os.path.join(output_dir, 'state_step*.pt')
+    candidates = glob.glob(pattern)
+    if not candidates:
+        return None
+
+    def _ckpt_key(path):
+        match = _CKPT_REGEX.search(os.path.basename(path))
+        return int(match.group(1)) if match else -1
+
+    latest = max(candidates, key=_ckpt_key)
+    if _ckpt_key(latest) < 0:
+        return None
+    return latest
+
 # -----------------------------------------------------------------------------
 # Argument parsing
 
@@ -744,6 +766,8 @@ group.add_argument('--device_0', action='store_true', default=False,
                    help='Always use device=0')
 group.add_argument('--seed', type=int, default=42,
                    help='random seed (default: 42)')
+group.add_argument('--resume', default='auto', type=str,
+                   help="checkpoint path to resume from, or 'auto' to load the newest checkpoint in --output")
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -878,6 +902,36 @@ def get_lr(it):
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
+# handle resume-from-checkpoint
+start_step = 0
+resume_training_time_ms = 0.0
+resolved_resume_path = None
+if args.resume:
+    if args.resume == 'auto':
+        resolved_resume_path = find_latest_checkpoint(args.output)
+        if resolved_resume_path is None and master_process:
+            logging.info(f"Auto-resume requested but no checkpoints found under {args.output}, starting fresh.")
+    else:
+        resolved_resume_path = args.resume
+
+    if resolved_resume_path and os.path.isfile(resolved_resume_path):
+        checkpoint = torch.load(resolved_resume_path, map_location='cpu')
+        raw_model.load_state_dict(checkpoint['model'])
+        checkpoint_opts = checkpoint.get('optimizers', [])
+        for opt, state in zip(optimizers, checkpoint_opts):
+            opt.load_state_dict(state)
+        checkpoint_schedulers = checkpoint.get('schedulers', [])
+        for sched, state in zip(schedulers, checkpoint_schedulers):
+            sched.load_state_dict(state)
+        start_step = checkpoint.get('step', 0) + 1
+        start_step = min(start_step, args.num_iterations)
+        resume_training_time_ms = checkpoint.get('training_time_ms', 0.0)
+        args.resume = resolved_resume_path
+        if master_process:
+            logging.info(f"Resumed from checkpoint {resolved_resume_path} at step {start_step}.")
+    elif args.resume and master_process:
+        logging.info(f"Resume requested but checkpoint {args.resume} not found. Starting from scratch.")
+
 # begin logging
 if master_process:
     run_id = str(uuid.uuid4())
@@ -975,12 +1029,12 @@ if master_process and tracking_x is not None:
 else:
     tracked_token_positions = None
 
-training_time_ms = 0
+training_time_ms = resume_training_time_ms
 # start the clock
 torch.cuda.synchronize()
 t0 = time.time()
 # begin training
-for step in range(args.num_iterations + 1):
+for step in range(start_step, args.num_iterations + 1):
     last_step = (step == args.num_iterations)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
@@ -1227,7 +1281,14 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
         # save the state of the training process
-        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+        log = dict(
+            step=step,
+            code=code,
+            model=raw_model.state_dict(),
+            optimizers=[opt.state_dict() for opt in optimizers],
+            schedulers=[sched.state_dict() for sched in schedulers],
+            training_time_ms=training_time_ms,
+        )
         torch.save(log, os.path.join(args.output, f'state_step{step:06d}.pt'))
         # start the clock again
         torch.cuda.synchronize()

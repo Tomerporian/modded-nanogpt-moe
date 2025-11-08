@@ -25,6 +25,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
+import torch._dynamo as dynamo
 from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
 
@@ -239,13 +240,15 @@ def diff_routing(logits, k):
     return topk_idx, probs, gate
 
 class MoE(nn.Module):
-    def __init__(self, config, num_experts=8, top_k=2, router_type='diff', router_depth=1):
+    def __init__(self, config, num_experts=8, top_k=2, router_type='diff', router_depth=1, global_load_balance=False, layer_idx=0):
         super().__init__()
         self.num_experts = num_experts
         self.top_k       = top_k
         assert 1 <= self.top_k <= self.num_experts, "`k` must be in [1, #experts]"
         self.router_type  = router_type
         self.router_depth = router_depth
+        self.global_load_balance = global_load_balance
+        self.layer_idx = layer_idx
 
         assert self.router_type in ('hash', 'switch', 'diff')
 
@@ -262,7 +265,7 @@ class MoE(nn.Module):
             self.router = None
 
 
-    def forward(self, x, token_idx=None, return_expert_assignments=False):
+    def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None):
 
         if self.router_type == "switch":
             logits = self.router(x)
@@ -299,8 +302,22 @@ class MoE(nn.Module):
             tokens_per_expert = torch.bincount(
                 idx_flat.flatten(), minlength=self.num_experts
             ).float()
+            local_total_tokens = tokens_per_expert.sum()
+            denom_local = torch.clamp(local_total_tokens, min=1.0)
 
-            frac = tokens_per_expert / tokens_per_expert.sum()
+            frac = tokens_per_expert / denom_local
+            global_frac_override = None
+
+            if self.global_load_balance and router_context is not None:
+                ctx_mode = router_context.get('mode', None)
+                if ctx_mode == 'collect':
+                    router_context['tokens_accum'][self.layer_idx] += tokens_per_expert
+                    router_context['totals_accum'][self.layer_idx] += local_total_tokens
+                elif ctx_mode == 'use':
+                    global_frac_tensor = router_context.get('global_frac', None)
+                    if global_frac_tensor is not None:
+                        global_frac_override = global_frac_tensor[self.layer_idx]
+
             # token-wise entropy of router distribution (normalized to [0,1])
             eps = 1e-9
             with torch.no_grad():
@@ -308,8 +325,10 @@ class MoE(nn.Module):
                 router_entropy = token_H.mean() / math.log(float(self.num_experts))
             # Switch paper:  L_aux = E * <load,prob>
             if self.router_type != "hash":
-                probs_mean = logits.softmax(dim=-1).reshape(-1, self.num_experts).mean(0)
-                aux = self.num_experts * (frac * probs_mean).sum()
+                probs_full = logits.softmax(dim=-1).reshape(-1, self.num_experts)
+                frac_for_aux = global_frac_override if global_frac_override is not None else frac
+                probs_mean = probs_full.mean(0)
+                aux = self.num_experts * (frac_for_aux * probs_mean).sum()
             elif self.router_type == "hash":
                 aux = torch.tensor(0.0, device=x.device, requires_grad=self.training)
             else:
@@ -323,19 +342,27 @@ class MoE(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config, num_experts=8, top_k=2, router_type='diff', router_depth=1):
+    def __init__(self, config, num_experts=8, top_k=2, router_type='diff', router_depth=1, global_load_balance=False, layer_idx=0):
         super().__init__()
         self.attn = CausalSelfAttention(config)
-        self.mlp = MoE(config, num_experts=num_experts, top_k=top_k, router_type=router_type, router_depth=router_depth)
+        self.mlp = MoE(
+            config,
+            num_experts=num_experts,
+            top_k=top_k,
+            router_type=router_type,
+            router_depth=router_depth,
+            global_load_balance=global_load_balance,
+            layer_idx=layer_idx,
+        )
 
-    def forward(self, x, token_idx=None, return_expert_assignments=False):
+    def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None):
         x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
         if return_expert_assignments:
-            mlp_out, aux, router_entropy, expert_balance, expert_assignments = self.mlp(F.rms_norm(x, (x.size(-1),)), token_idx, return_expert_assignments=True)
+            mlp_out, aux, router_entropy, expert_balance, expert_assignments = self.mlp(F.rms_norm(x, (x.size(-1),)), token_idx, return_expert_assignments=True, router_context=router_context)
             x = x + mlp_out
             return x, aux, router_entropy, expert_balance, expert_assignments
         else:
-            mlp_out, aux, router_entropy, expert_balance = self.mlp(F.rms_norm(x, (x.size(-1),)), token_idx)
+            mlp_out, aux, router_entropy, expert_balance = self.mlp(F.rms_norm(x, (x.size(-1),)), token_idx, router_context=router_context)
             x = x + mlp_out
             return x, aux, router_entropy, expert_balance
 
@@ -352,6 +379,7 @@ class GPTConfig:
     top_k : int = 2
     router_type : str = 'diff'
     router_depth : int = 1
+    global_load_balance : bool = False
 
 class GPT(nn.Module):
 
@@ -367,15 +395,17 @@ class GPT(nn.Module):
                     num_experts=config.num_experts,
                     top_k=config.top_k,
                     router_type=config.router_type,
-                    router_depth=config.router_depth
+                    router_depth=config.router_depth,
+                    global_load_balance=config.global_load_balance,
+                    layer_idx=layer_idx,
                 )
-                for _ in range(config.n_layer)
+                for layer_idx in range(config.n_layer)
             ]),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_()
 
-    def forward(self, idx, targets=None, return_logits=True, aux_coeff=0.0, return_expert_assignments=False):
+    def forward(self, idx, targets=None, return_logits=True, aux_coeff=0.0, return_expert_assignments=False, router_context=None):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -388,10 +418,10 @@ class GPT(nn.Module):
         all_layer_expert_assignments = []
         for block in self.transformer.h:
             if return_expert_assignments:
-                x, aux, router_entropy, expert_balance, expert_assignments = block(x, idx, return_expert_assignments=True)
+                x, aux, router_entropy, expert_balance, expert_assignments = block(x, idx, return_expert_assignments=True, router_context=router_context)
                 all_layer_expert_assignments.append(expert_assignments)
             else:
-                x, aux, router_entropy, expert_balance = block(x, idx)
+                x, aux, router_entropy, expert_balance = block(x, idx, router_context=router_context)
             total_aux = total_aux + aux
             total_router_entropy = total_router_entropy + router_entropy
             if total_expert_balance is None:
@@ -707,6 +737,8 @@ group.add_argument('--router-type', default='diff', type=str, choices=['switch',
                    help='router type for MoE')
 group.add_argument('--router-depth', default=1, type=int,
                    help='number of layers in the router MLP for non-hash routing (hidden dim == input dim)')
+group.add_argument('--global-load-balance', action='store_true', default=False,
+                   help='enable global batch load balancing for auxiliary router loss')
 
 # Optimization parameters
 group = parser.add_argument_group('Optimization parameters')
@@ -854,7 +886,8 @@ model = GPT(GPTConfig(
     num_experts=args.num_experts,
     top_k=args.top_k,
     router_type=args.router_type,
-    router_depth=args.router_depth
+    router_depth=args.router_depth,
+    global_load_balance=args.global_load_balance
 ))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
@@ -970,6 +1003,8 @@ if master_process:
         'model_router_type': raw_model.transformer.h[0].mlp.router_type,
         'model_router_top_k': raw_model.transformer.h[0].mlp.top_k,
         'model_router_depth': raw_model.transformer.h[0].mlp.router_depth,
+        'global_load_balance': args.global_load_balance,
+        'model_global_load_balance': raw_model.config.global_load_balance,
         'optimizer_embed_lr': optimizer1.param_groups[0]['lr'],
         'optimizer_embed_betas': tuple(optimizer1.param_groups[0]['betas']),
         'optimizer_embed_fused': bool(optimizer1.param_groups[0].get('fused', False)),
@@ -1303,23 +1338,57 @@ for step in range(start_step, args.num_iterations + 1):
 
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
+    n_layers = raw_model.config.n_layer
+    use_global_lb = raw_model.config.global_load_balance
+    router_context_use = None
+    cached_batches = None
+
+    if use_global_lb:
+        cached_batches = []
+        tokens_accum = torch.zeros(n_layers, num_experts, device=device)
+        totals_accum = torch.zeros(n_layers, device=device)
+        collect_context = {
+            'mode': 'collect',
+            'tokens_accum': tokens_accum,
+            'totals_accum': totals_accum,
+        }
+        for _ in range(train_accumulation_steps):
+            cached_batches.append((x.clone(), y.clone()))
+            with torch.no_grad():
+                with ctx:
+                    model(x, y, return_logits=False, aux_coeff=0.0, router_context=collect_context)
+            x, y = train_loader.next_batch()
+        dist.all_reduce(tokens_accum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(totals_accum, op=dist.ReduceOp.SUM)
+        denom = torch.clamp(totals_accum.unsqueeze(1), min=1.0)
+        global_frac = tokens_accum / denom
+        router_context_use = {
+            'mode': 'use',
+            'global_frac': global_frac,
+        }
+
     router_entropy_sum = torch.tensor(0.0, device=device)
     expert_balance_sum = torch.zeros(num_experts, device=device)
-    # per-layer accumulators
-    n_layers = raw_model.config.n_layer
     layer_router_entropy_sum = torch.zeros(n_layers, device=device)
     layer_expert_balance_sum = torch.zeros(n_layers, num_experts, device=device)
     for i in range(1, train_accumulation_steps+1):
+        if use_global_lb:
+            x_batch, y_batch = cached_batches[i-1]
+        else:
+            x_batch, y_batch = x, y
         # forward pass
         with ctx:
-            _, loss, ce_loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(x, y, return_logits=False, aux_coeff=args.aux_coeff_train)
+            _, loss, ce_loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(
+                x_batch, y_batch, return_logits=False, aux_coeff=args.aux_coeff_train, router_context=router_context_use
+            )
             train_loss = loss.detach()
             router_entropy_sum = router_entropy_sum + router_entropy.detach()
             expert_balance_sum = expert_balance_sum + expert_balance.detach()
             layer_router_entropy_sum = layer_router_entropy_sum + layer_router_entropy.detach()
             layer_expert_balance_sum = layer_expert_balance_sum + layer_expert_balance.detach()
-        # advance the dataset for the next batch
-        x, y = train_loader.next_batch()
+        if not use_global_lb:
+            # advance the dataset for the next batch
+            x, y = train_loader.next_batch()
         # backward pass
         if i < train_accumulation_steps:
             with model.no_sync(): # there's no need to sync gradients every accumulation step

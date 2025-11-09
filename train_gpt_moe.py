@@ -239,18 +239,24 @@ def diff_routing(logits, k):
     gate, topk_idx = torch.topk(topk_weights, k, dim=-1)
     return topk_idx, probs, gate
 
+class ReLUSquared(nn.Module):
+    def forward(self, x):
+        return torch.relu(x).square()
+
 class MoE(nn.Module):
-    def __init__(self, config, num_experts=8, top_k=2, router_type='diff', router_depth=1, global_load_balance=False, layer_idx=0):
+    def __init__(self, config, num_experts=8, top_k=2, router_type='diff', router_depth=1, router_activation='gelu', global_load_balance=False, layer_idx=0):
         super().__init__()
         self.num_experts = num_experts
         self.top_k       = top_k
         assert 1 <= self.top_k <= self.num_experts, "`k` must be in [1, #experts]"
         self.router_type  = router_type
         self.router_depth = router_depth
+        self.router_activation = router_activation
         self.global_load_balance = global_load_balance
         self.layer_idx = layer_idx
 
         assert self.router_type in ('hash', 'switch', 'diff')
+        assert self.router_activation in ('gelu', 'relu', 'relu_squared')
 
         self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
         
@@ -258,11 +264,21 @@ class MoE(nn.Module):
             layers = []
             for _ in range(router_depth - 1):
                 layers.append(nn.Linear(config.n_embd, config.n_embd, bias=False))
-                layers.append(nn.GELU())
+                layers.append(self._build_router_activation())
             layers.append(nn.Linear(config.n_embd, self.num_experts, bias=False))
             self.router = nn.Sequential(*layers)
         else:
             self.router = None
+
+    def _build_router_activation(self):
+        if self.router_activation == 'gelu':
+            return nn.GELU()
+        elif self.router_activation == 'relu':
+            return nn.ReLU()
+        elif self.router_activation == 'relu_squared':
+            return ReLUSquared()
+        else:
+            raise ValueError(f"Unsupported router activation: {self.router_activation}")
 
 
     def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None):
@@ -342,7 +358,7 @@ class MoE(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config, num_experts=8, top_k=2, router_type='diff', router_depth=1, global_load_balance=False, layer_idx=0):
+    def __init__(self, config, num_experts=8, top_k=2, router_type='diff', router_depth=1, router_activation='gelu', global_load_balance=False, layer_idx=0):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.mlp = MoE(
@@ -351,6 +367,7 @@ class Block(nn.Module):
             top_k=top_k,
             router_type=router_type,
             router_depth=router_depth,
+            router_activation=router_activation,
             global_load_balance=global_load_balance,
             layer_idx=layer_idx,
         )
@@ -379,6 +396,7 @@ class GPTConfig:
     top_k : int = 2
     router_type : str = 'diff'
     router_depth : int = 1
+    router_activation : str = 'gelu'
     global_load_balance : bool = False
 
 class GPT(nn.Module):
@@ -396,6 +414,7 @@ class GPT(nn.Module):
                     top_k=config.top_k,
                     router_type=config.router_type,
                     router_depth=config.router_depth,
+                    router_activation=config.router_activation,
                     global_load_balance=config.global_load_balance,
                     layer_idx=layer_idx,
                 )
@@ -737,6 +756,8 @@ group.add_argument('--router-type', default='diff', type=str, choices=['switch',
                    help='router type for MoE')
 group.add_argument('--router-depth', default=1, type=int,
                    help='number of layers in the router MLP for non-hash routing (hidden dim == input dim)')
+group.add_argument('--router-activation', default='gelu', type=str, choices=['gelu', 'relu', 'relu_squared'],
+                   help='activation to use between router MLP layers (if depth > 1)')
 group.add_argument('--global-load-balance', action='store_true', default=False,
                    help='enable global batch load balancing for auxiliary router loss')
 
@@ -887,6 +908,7 @@ model = GPT(GPTConfig(
     top_k=args.top_k,
     router_type=args.router_type,
     router_depth=args.router_depth,
+    router_activation=args.router_activation,
     global_load_balance=args.global_load_balance
 ))
 model = model.cuda()
@@ -1003,6 +1025,7 @@ if master_process:
         'model_router_type': raw_model.transformer.h[0].mlp.router_type,
         'model_router_top_k': raw_model.transformer.h[0].mlp.top_k,
         'model_router_depth': raw_model.transformer.h[0].mlp.router_depth,
+        'model_router_activation': raw_model.transformer.h[0].mlp.router_activation,
         'global_load_balance': args.global_load_balance,
         'model_global_load_balance': raw_model.config.global_load_balance,
         'optimizer_embed_lr': optimizer1.param_groups[0]['lr'],

@@ -321,14 +321,19 @@ class MoE(nn.Module):
     def loss_free_enabled(self):
         return self.loss_free_mode != 'none'
 
-    def _loss_free_bias(self, logits):
+    def _loss_free_bias_vector(self):
         if not self.loss_free_enabled:
             return None
         if self.loss_free_bias_rule == 'sign':
             bias_vec = self.loss_free_bias_state * self.loss_free_strength
         else:
             bias_vec = (1.0 / self.num_experts - self.loss_free_ema) * self.loss_free_strength
-        bias_vec = bias_vec - bias_vec.mean()
+        return bias_vec - bias_vec.mean()
+
+    def _loss_free_bias(self, logits):
+        bias_vec = self._loss_free_bias_vector()
+        if bias_vec is None:
+            return None
         bias_vec = bias_vec.to(dtype=logits.dtype, device=logits.device)
         view_shape = [1] * (logits.dim() - 1) + [self.num_experts]
         return bias_vec.view(*view_shape)
@@ -1513,6 +1518,12 @@ for step in range(start_step, args.num_iterations + 1):
                 wandb_log[f'Router Entropy/Layer {li}'] = float(val_layer_router_entropy[li].item())
                 for ei in range(num_experts):
                     wandb_log[f'Expert Balance/Layer {li}/{ei}'] = float(val_layer_expert_balance[li, ei].item())
+                mlp = raw_model.transformer.h[li].mlp
+                bias_vec = mlp._loss_free_bias_vector()
+                if bias_vec is not None:
+                    bias_vals = bias_vec.detach().float().cpu()
+                    for ei in range(mlp.num_experts):
+                        wandb_log[f'val_loss_free_bias/Layer {li}/expert_{ei}'] = float(bias_vals[ei].item())
             wandb_log['train/time_ms'] = float(training_time_ms)
             wandb_log['train/step_avg_ms'] = float(training_time_ms/(timed_steps-1))
             wandb.log(wandb_log, step=step)
@@ -1668,6 +1679,12 @@ for step in range(start_step, args.num_iterations + 1):
             wandb_log[f'Router Entropy/Layer {li}'] = float(layer_router_entropy_avg[li].item())
             for ei in range(num_experts):
                 wandb_log[f'Expert Balance/Layer {li}/{ei}'] = float(layer_expert_balance_avg[li, ei].item())
+            mlp = raw_model.transformer.h[li].mlp
+            bias_vec = mlp._loss_free_bias_vector()
+            if bias_vec is not None:
+                bias_vals = bias_vec.detach().float().cpu()
+                for ei in range(mlp.num_experts):
+                    wandb_log[f'train_loss_free_bias/Layer {li}/expert_{ei}'] = float(bias_vals[ei].item())
         wandb.log(wandb_log, step=step+1)
 
 if master_process:

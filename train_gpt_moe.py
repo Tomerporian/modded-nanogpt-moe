@@ -209,11 +209,16 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
-def switch_topk(logits, k, null_expert_bias=0.0):
+def switch_topk(logits, k, null_expert_bias=0.0, weight_logits=None, probs_override=None):
     """Switch/Top‑k. Returns (indices, probs, expert output weights)."""
-    probs      = logits.softmax(dim=-1)
-    gate, topk_idx = torch.topk(probs, k, dim=-1)
-    gate = gate / (gate.sum(dim=-1, keepdim=True) + null_expert_bias)
+    probs_from_logits = logits.softmax(dim=-1)
+    probs = probs_override if probs_override is not None else probs_from_logits
+    gate_vals, topk_idx = torch.topk(probs_from_logits, k, dim=-1)
+    if weight_logits is None:
+        gate = gate_vals / (gate_vals.sum(dim=-1, keepdim=True) + null_expert_bias)
+    else:
+        topk_logits = torch.gather(weight_logits, dim=-1, index=topk_idx)
+        gate = F.softmax(topk_logits, dim=-1)
     return topk_idx, probs, gate
 
 
@@ -244,7 +249,22 @@ class ReLUSquared(nn.Module):
         return torch.relu(x).square()
 
 class MoE(nn.Module):
-    def __init__(self, config, num_experts=8, top_k=2, router_type='diff', router_depth=1, router_activation='gelu', global_load_balance=False, layer_idx=0):
+    def __init__(
+        self,
+        config,
+        num_experts=8,
+        top_k=2,
+        router_type='diff',
+        router_depth=1,
+        router_activation='gelu',
+        global_load_balance=False,
+        layer_idx=0,
+        loss_free_mode='none',
+        loss_free_decay=0.99,
+        loss_free_strength=1.0,
+        loss_free_update_rate=0.001,
+        loss_free_bias_rule='ema',
+    ):
         super().__init__()
         self.num_experts = num_experts
         self.top_k       = top_k
@@ -254,11 +274,28 @@ class MoE(nn.Module):
         self.router_activation = router_activation
         self.global_load_balance = global_load_balance
         self.layer_idx = layer_idx
+        self.loss_free_mode = loss_free_mode
+        self.loss_free_decay = loss_free_decay
+        self.loss_free_strength = loss_free_strength
+        self.loss_free_update_rate = loss_free_update_rate
+        self.loss_free_bias_rule = loss_free_bias_rule
 
         assert self.router_type in ('hash', 'switch', 'diff')
         assert self.router_activation in ('gelu', 'relu', 'relu_squared')
+        assert self.loss_free_mode in ('none', 'deepseek', 'stopgrad')
+        assert self.loss_free_bias_rule in ('ema', 'sign')
+        if self.router_type == 'hash' and self.loss_free_mode != 'none':
+            raise ValueError("Loss-free load balancing requires a learned router (switch or diff).")
+        if self.loss_free_mode == 'deepseek' and self.router_type != 'switch':
+            raise ValueError("DeepSeek-style loss-free routing is only defined for switch routers.")
 
         self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
+        init_frac = torch.full((self.num_experts,), 1.0 / self.num_experts, dtype=torch.float32)
+        self.register_buffer('loss_free_ema', init_frac, persistent=True)
+        self.register_buffer('loss_free_bias_state', torch.zeros(self.num_experts, dtype=torch.float32), persistent=True)
+        self.register_buffer('loss_free_tokens_accum', torch.zeros(self.num_experts, dtype=torch.float32), persistent=False)
+        self.register_buffer('loss_free_total_accum', torch.tensor(0.0, dtype=torch.float32), persistent=False)
+        self.loss_free_override_frac = None
         
         if self.router_type != 'hash':
             layers = []
@@ -280,15 +317,111 @@ class MoE(nn.Module):
         else:
             raise ValueError(f"Unsupported router activation: {self.router_activation}")
 
+    @property
+    def loss_free_enabled(self):
+        return self.loss_free_mode != 'none'
+
+    def _loss_free_bias(self, logits):
+        if not self.loss_free_enabled:
+            return None
+        if self.loss_free_bias_rule == 'sign':
+            bias_vec = self.loss_free_bias_state * self.loss_free_strength
+        else:
+            bias_vec = (1.0 / self.num_experts - self.loss_free_ema) * self.loss_free_strength
+        bias_vec = bias_vec - bias_vec.mean()
+        bias_vec = bias_vec.to(dtype=logits.dtype, device=logits.device)
+        view_shape = [1] * (logits.dim() - 1) + [self.num_experts]
+        return bias_vec.view(*view_shape)
+
+    def _update_loss_free_state(self, frac_tensor):
+        if not self.loss_free_enabled or not self.training:
+            return
+        with torch.no_grad():
+            decay = self.loss_free_decay
+            update = frac_tensor.detach().to(self.loss_free_ema.dtype)
+            self.loss_free_ema.mul_(decay).add_(update * (1.0 - decay))
+
+    def _update_sign_bias(self, frac_tensor):
+        if not self.loss_free_enabled or not self.training:
+            return
+        if frac_tensor is None:
+            return
+        with torch.no_grad():
+            target = 1.0 / self.num_experts
+            update = frac_tensor.detach().to(dtype=self.loss_free_bias_state.dtype, device=self.loss_free_bias_state.device)
+            violation = update - target
+            step = torch.sign(violation) * self.loss_free_update_rate
+            self.loss_free_bias_state.add_(step)
+            self.loss_free_bias_state.add_(-self.loss_free_bias_state.mean())
+
+    def _accumulate_loss_free_tokens(self, tokens_per_expert):
+        if not self.loss_free_enabled or not self.training:
+            return
+        with torch.no_grad():
+            self.loss_free_tokens_accum.add_(tokens_per_expert.to(self.loss_free_tokens_accum.dtype))
+            self.loss_free_total_accum.add_(tokens_per_expert.sum().to(self.loss_free_total_accum.dtype))
+
+    def _set_loss_free_override(self, frac_tensor):
+        if not self.loss_free_enabled or not self.training:
+            return
+        self.loss_free_override_frac = frac_tensor.detach().to(self.loss_free_ema.dtype, device=self.loss_free_ema.device).clone()
+
+    def _reset_loss_free_accumulators(self):
+        self.loss_free_tokens_accum.zero_()
+        self.loss_free_total_accum.zero_()
+        self.loss_free_override_frac = None
+
+    def finalize_loss_free_update(self):
+        if not self.loss_free_enabled:
+            self._reset_loss_free_accumulators()
+            return
+        frac = None
+        if self.loss_free_override_frac is not None:
+            frac = self.loss_free_override_frac
+        else:
+            total = float(self.loss_free_total_accum.item())
+            if total > 0:
+                frac = self.loss_free_tokens_accum / total
+        if frac is not None:
+            if self.loss_free_bias_rule == 'sign':
+                self._update_sign_bias(frac)
+            elif self.loss_free_bias_rule == 'ema':
+                self._update_loss_free_state(frac)
+        self._reset_loss_free_accumulators()
 
     def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None):
 
+        ctx_mode = router_context.get('mode', None) if router_context is not None else None
+        logits = None
+        logits_for_selection = None
+        logits_for_weights = None
+        logits_for_stats = None
+        if self.router_type in ("switch", "diff"):
+            logits = self.router(x)
+            bias = self._loss_free_bias(logits)
+            if self.loss_free_mode == 'deepseek' and bias is not None:
+                logits_for_selection = logits + bias
+                logits_for_weights = logits
+            elif self.loss_free_mode == 'stopgrad' and bias is not None:
+                bias_detached = bias.detach()
+                logits_for_selection = logits + bias_detached
+                logits_for_weights = logits_for_selection
+            else:
+                logits_for_selection = logits
+                logits_for_weights = logits
+            logits_for_stats = logits_for_weights
         if self.router_type == "switch":
-            logits = self.router(x)
-            topk_idx, probs, gate = switch_topk(logits, self.top_k)
+            router_probs = logits_for_stats.softmax(dim=-1)
+            topk_idx, _, gate = switch_topk(
+                logits_for_selection,
+                self.top_k,
+                weight_logits=logits_for_weights,
+                probs_override=router_probs,
+            )
+            probs = router_probs
         elif self.router_type == "diff":
-            logits = self.router(x)
-            topk_idx, probs, gate = diff_routing(logits, self.top_k)
+            topk_idx, _, gate = diff_routing(logits_for_selection, self.top_k)
+            probs = logits_for_weights.softmax(dim=-1)
         elif self.router_type == "hash":
             topk_idx, probs, gate = hash_select(token_idx, self.num_experts)
             gate = gate.to(x.dtype)
@@ -325,7 +458,6 @@ class MoE(nn.Module):
             global_frac_override = None
 
             if self.global_load_balance and router_context is not None:
-                ctx_mode = router_context.get('mode', None)
                 if ctx_mode == 'collect':
                     router_context['tokens_accum'][self.layer_idx] += tokens_per_expert
                     router_context['totals_accum'][self.layer_idx] += local_total_tokens
@@ -334,6 +466,12 @@ class MoE(nn.Module):
                     if global_frac_tensor is not None:
                         global_frac_override = global_frac_tensor[self.layer_idx]
 
+            if self.loss_free_enabled and self.training and ctx_mode != 'collect':
+                if global_frac_override is not None:
+                    self._set_loss_free_override(global_frac_override)
+                else:
+                    self._accumulate_loss_free_tokens(tokens_per_expert)
+
             # token-wise entropy of router distribution (normalized to [0,1])
             eps = 1e-9
             with torch.no_grad():
@@ -341,7 +479,7 @@ class MoE(nn.Module):
                 router_entropy = token_H.mean() / math.log(float(self.num_experts))
             # Switch paper:  L_aux = E * <load,prob>
             if self.router_type != "hash":
-                probs_full = logits.softmax(dim=-1).reshape(-1, self.num_experts)
+                probs_full = logits_for_stats.softmax(dim=-1).reshape(-1, self.num_experts)
                 frac_for_aux = global_frac_override if global_frac_override is not None else frac
                 probs_mean = probs_full.mean(0)
                 aux = self.num_experts * (frac_for_aux * probs_mean).sum()
@@ -358,7 +496,22 @@ class MoE(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config, num_experts=8, top_k=2, router_type='diff', router_depth=1, router_activation='gelu', global_load_balance=False, layer_idx=0):
+    def __init__(
+        self,
+        config,
+        num_experts=8,
+        top_k=2,
+        router_type='diff',
+        router_depth=1,
+        router_activation='gelu',
+        global_load_balance=False,
+        layer_idx=0,
+        loss_free_mode='none',
+        loss_free_decay=0.99,
+        loss_free_strength=1.0,
+        loss_free_update_rate=0.001,
+        loss_free_bias_rule='ema',
+    ):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.mlp = MoE(
@@ -370,6 +523,11 @@ class Block(nn.Module):
             router_activation=router_activation,
             global_load_balance=global_load_balance,
             layer_idx=layer_idx,
+            loss_free_mode=loss_free_mode,
+            loss_free_decay=loss_free_decay,
+            loss_free_strength=loss_free_strength,
+            loss_free_update_rate=loss_free_update_rate,
+            loss_free_bias_rule=loss_free_bias_rule,
         )
 
     def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None):
@@ -398,6 +556,11 @@ class GPTConfig:
     router_depth : int = 1
     router_activation : str = 'gelu'
     global_load_balance : bool = False
+    loss_free_mode : str = 'none'
+    loss_free_decay : float = 0.99
+    loss_free_strength : float = 1.0
+    loss_free_update_rate : float = 0.001
+    loss_free_bias_rule : str = 'ema'
 
 class GPT(nn.Module):
 
@@ -417,6 +580,11 @@ class GPT(nn.Module):
                     router_activation=config.router_activation,
                     global_load_balance=config.global_load_balance,
                     layer_idx=layer_idx,
+                    loss_free_mode=config.loss_free_mode,
+                    loss_free_decay=config.loss_free_decay,
+                    loss_free_strength=config.loss_free_strength,
+                    loss_free_update_rate=config.loss_free_update_rate,
+                    loss_free_bias_rule=config.loss_free_bias_rule,
                 )
                 for layer_idx in range(config.n_layer)
             ]),
@@ -481,6 +649,10 @@ class GPT(nn.Module):
             return logits, loss, ce_loss, total_aux, avg_router_entropy, avg_expert_balance, layer_router_entropy, layer_expert_balance, stacked_assignments
         else:
             return logits, loss, ce_loss, total_aux, avg_router_entropy, avg_expert_balance, layer_router_entropy, layer_expert_balance
+
+    def finalize_loss_free_updates(self):
+        for block in self.transformer.h:
+            block.mlp.finalize_loss_free_update()
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -760,6 +932,16 @@ group.add_argument('--router-activation', default='gelu', type=str, choices=['ge
                    help='activation to use between router MLP layers (if depth > 1)')
 group.add_argument('--global-load-balance', action='store_true', default=False,
                    help='enable global batch load balancing for auxiliary router loss')
+group.add_argument('--loss-free-mode', default='none', type=str, choices=['none', 'deepseek', 'stopgrad'],
+                   help='loss-free router biasing strategy (deepseek for switch only, stopgrad supports switch/diff)')
+group.add_argument('--loss-free-decay', default=0.99, type=float,
+                   help='EMA decay for tracking per-layer expert usage in loss-free routing')
+group.add_argument('--loss-free-strength', default=1.0, type=float,
+                   help='scale factor applied to the loss-free routing bias')
+group.add_argument('--loss-free-update-rate', default=0.001, type=float,
+                   help='per-expert bias update rate for sign-based loss-free routing')
+group.add_argument('--loss-free-bias-rule', default='ema', type=str, choices=['ema', 'sign'],
+                   help='controls whether router bias uses EMA or sign-step updates')
 
 # Optimization parameters
 group = parser.add_argument_group('Optimization parameters')
@@ -909,7 +1091,12 @@ model = GPT(GPTConfig(
     router_type=args.router_type,
     router_depth=args.router_depth,
     router_activation=args.router_activation,
-    global_load_balance=args.global_load_balance
+    global_load_balance=args.global_load_balance,
+    loss_free_mode=args.loss_free_mode,
+    loss_free_decay=args.loss_free_decay,
+    loss_free_strength=args.loss_free_strength,
+    loss_free_update_rate=args.loss_free_update_rate,
+    loss_free_bias_rule=args.loss_free_bias_rule,
 ))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
@@ -1453,6 +1640,7 @@ for step in range(start_step, args.num_iterations + 1):
     current_blocks_lr = optimizers[2].param_groups[0]['lr']
     # null the gradients
     model.zero_grad(set_to_none=True)
+    raw_model.finalize_loss_free_updates()
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 

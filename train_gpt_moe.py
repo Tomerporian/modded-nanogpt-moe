@@ -244,6 +244,19 @@ def diff_routing(logits, k):
     gate, topk_idx = torch.topk(topk_weights, k, dim=-1)
     return topk_idx, probs, gate
 
+
+def maxvio_per_layer(balance_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Compute per-layer MaxVio (maximal violation) as defined in Eq. (4) of
+    Wang et al. (2024), i.e., (max_i Load_i - Load_bar) / Load_bar.
+    """
+    if balance_tensor.ndim == 1:
+        balance_tensor = balance_tensor.unsqueeze(0)
+    expected_frac = balance_tensor.new_tensor(1.0 / balance_tensor.size(-1))
+    per_layer_max = balance_tensor.max(dim=-1).values
+    return (per_layer_max - expected_frac) / expected_frac
+
+
 class ReLUSquared(nn.Module):
     def forward(self, x):
         return torch.relu(x).square()
@@ -1512,10 +1525,14 @@ for step in range(start_step, args.num_iterations + 1):
                 'val/aux_loss': float(val_aux_loss.item() if isinstance(val_aux_loss, torch.Tensor) else val_aux_loss),
                 'val/router_entropy': float(val_router_entropy.item()),
             }
+            val_maxvio_layers = maxvio_per_layer(val_layer_expert_balance.detach())
+            val_maxvio_layers_cpu = val_maxvio_layers.cpu()
+            wandb_log['val/MaxVioglobal'] = float(val_maxvio_layers_cpu.mean().item())
             for i in range(num_experts):
                 wandb_log[f'val/expert_balance/{i}'] = float(val_expert_balance[i].item())
             for li in range(n_layers):
                 wandb_log[f'Router Entropy/Layer {li}'] = float(val_layer_router_entropy[li].item())
+                wandb_log[f'val/MaxVioglobal/Layer {li}'] = float(val_maxvio_layers_cpu[li].item())
                 for ei in range(num_experts):
                     wandb_log[f'Expert Balance/Layer {li}/{ei}'] = float(val_layer_expert_balance[li, ei].item())
                 mlp = raw_model.transformer.h[li].mlp
@@ -1672,11 +1689,15 @@ for step in range(start_step, args.num_iterations + 1):
             'lr/head': float(current_head_lr),
             'lr/blocks': float(current_blocks_lr),
         }
+        train_maxvio_layers = maxvio_per_layer(layer_expert_balance_avg.detach())
+        train_maxvio_layers_cpu = train_maxvio_layers.cpu()
+        wandb_log['train/MaxViobatch'] = float(train_maxvio_layers_cpu.mean().item())
         for i_exp in range(num_experts):
             wandb_log[f'train/expert_balance/{i_exp}'] = float(expert_balance_avg[i_exp].item())
         # per-layer router stats (no per-step grad norms anymore)
         for li in range(n_layers):
             wandb_log[f'Router Entropy/Layer {li}'] = float(layer_router_entropy_avg[li].item())
+            wandb_log[f'train/MaxViobatch/Layer {li}'] = float(train_maxvio_layers_cpu[li].item())
             for ei in range(num_experts):
                 wandb_log[f'Expert Balance/Layer {li}/{ei}'] = float(layer_expert_balance_avg[li, ei].item())
             mlp = raw_model.transformer.h[li].mlp

@@ -397,9 +397,14 @@ class MoE(nn.Module):
         if self.loss_free_override_frac is not None:
             frac = self.loss_free_override_frac
         else:
-            total = float(self.loss_free_total_accum.item())
-            if total > 0:
-                frac = self.loss_free_tokens_accum / total
+            tokens = self.loss_free_tokens_accum.clone()
+            total = self.loss_free_total_accum.clone()
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(tokens, op=dist.ReduceOp.SUM)
+                dist.all_reduce(total, op=dist.ReduceOp.SUM)
+            total_val = float(total.item())
+            if total_val > 0:
+                frac = tokens / total_val
         if frac is not None:
             if self.loss_free_bias_rule == 'sign':
                 self._update_sign_bias(frac)

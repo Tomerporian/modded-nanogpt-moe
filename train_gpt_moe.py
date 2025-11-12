@@ -979,6 +979,8 @@ group.add_argument('--weight-decay', default=0.0, type=float,
                    help='weight decay')
 group.add_argument('--use_adamw_opt3', action='store_true', default=False,
                    help='use AdamW instead of Muon for transformer blocks')
+group.add_argument('--use_adamw_router', action='store_true', default=False,
+                   help='optimize router parameters with AdamW instead of Muon (requires learned routers)')
 
 # Learning rate parameters
 group = parser.add_argument_group('Learning rate parameters')
@@ -1141,12 +1143,28 @@ enable_math_sdp(False)
 all_h_params = list(raw_model.transformer.h.parameters())
 optimizer1 = torch.optim.AdamW([raw_model.transformer.wte.weight], lr=args.lr_embed, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
 optimizer2 = torch.optim.AdamW([raw_model.lm_head.weight], lr=args.lr_head, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
+router_optimizer = None
 
-if args.use_adamw_opt3:    
+if args.use_adamw_opt3:
     optimizer3 = torch.optim.AdamW(all_h_params, lr=6e-4, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
 else:
-    optimizer3 = Muon(all_h_params, lr=args.lr_muon, momentum=args.momentum)
+    muon_params = all_h_params
+    if args.use_adamw_router:
+        router_params = []
+        for block in raw_model.transformer.h:
+            router_module = getattr(block.mlp, 'router', None)
+            if router_module is not None:
+                router_params.extend(list(router_module.parameters()))
+        if router_params:
+            router_param_ids = {id(p) for p in router_params}
+            muon_params = [p for p in all_h_params if id(p) not in router_param_ids]
+            router_optimizer = torch.optim.AdamW(router_params, lr=args.lr_muon, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
+        elif master_process:
+            logging.warning("AdamW router optimization requested, but no router parameters were found.")
+    optimizer3 = Muon(muon_params, lr=args.lr_muon, momentum=args.momentum)
 optimizers = [optimizer1, optimizer2, optimizer3]
+if router_optimizer is not None:
+    optimizers.append(router_optimizer)
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -1248,6 +1266,12 @@ if master_process:
         'torch_compile': True,
         'attention_backend': 'cudnn_sdp',
     })
+    if router_optimizer is not None:
+        config.update({
+            'optimizer_router_lr': router_optimizer.param_groups[0]['lr'],
+            'optimizer_router_betas': tuple(router_optimizer.param_groups[0]['betas']),
+            'optimizer_router_fused': bool(router_optimizer.param_groups[0].get('fused', False)),
+        })
     
     run_name = os.path.basename(args.output)
     # group seeds
@@ -1666,6 +1690,7 @@ for step in range(start_step, args.num_iterations + 1):
     current_embed_lr = optimizers[0].param_groups[0]['lr']
     current_head_lr = optimizers[1].param_groups[0]['lr']
     current_blocks_lr = optimizers[2].param_groups[0]['lr']
+    current_router_lr = router_optimizer.param_groups[0]['lr'] if router_optimizer is not None else None
     # null the gradients
     model.zero_grad(set_to_none=True)
     raw_model.finalize_loss_free_updates()
@@ -1689,6 +1714,8 @@ for step in range(start_step, args.num_iterations + 1):
             'lr/head': float(current_head_lr),
             'lr/blocks': float(current_blocks_lr),
         }
+        if current_router_lr is not None:
+            wandb_log['lr/router'] = float(current_router_lr)
         train_maxvio_layers = maxvio_per_layer(layer_expert_balance_avg.detach())
         train_maxvio_layers_cpu = train_maxvio_layers.cpu()
         wandb_log['train/MaxViobatch'] = float(train_maxvio_layers_cpu.mean().item())

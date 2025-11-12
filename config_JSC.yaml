@@ -1,5 +1,5 @@
 job_details:
-  name: aux_coeff
+  name: loss_free
   output_dir: logs/seeds_and_datasets
 
 parameters:
@@ -60,20 +60,24 @@ parameters:
     - loss_free_mode: ['deepseek']
       router_type: ['switch']
       loss_free_bias_rule: ['sign']
-      loss_free_update_rate: [0.01, 0.001, 0.0001]
+      loss_free_update_rate: [0.1, 0.2]
       loss_free_decay: [0.99]
+      loss_free_strength: [2.0, 4.0]
     - loss_free_mode: ['deepseek']
       router_type: ['switch']
       loss_free_bias_rule: ['ema']
       loss_free_update_rate: [0.001]
-      loss_free_decay: [0.99, 0.95]
+      loss_free_decay: [0.99, 0.9]
+      loss_free_strength: [2.0, 4.0]
     - loss_free_mode: ['stopgrad']
       router_type: ['switch', 'diff']
       loss_free_bias_rule: ['sign']
-      loss_free_update_rate: [0.01, 0.001, 0.0001]
+      loss_free_update_rate: [0.1, 0.2]
       loss_free_decay: [0.99]
+      loss_free_strength: [2.0, 4.0]
     - loss_free_mode: ['stopgrad']
       router_type: ['switch', 'diff']
       loss_free_bias_rule: ['ema']
       loss_free_update_rate: [0.001]
-      loss_free_decay: [0.99, 0.95]
+      loss_free_decay: [0.99, 0.9]
+      loss_free_strength: [2.0, 4.0]

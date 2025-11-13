@@ -367,7 +367,7 @@ class MoE(nn.Module):
         with torch.no_grad():
             target = 1.0 / self.num_experts
             update = frac_tensor.detach().to(dtype=self.loss_free_bias_state.dtype, device=self.loss_free_bias_state.device)
-            violation = update - target
+            violation = target - update
             step = torch.sign(violation) * self.loss_free_update_rate
             self.loss_free_bias_state.add_(step)
             self.loss_free_bias_state.add_(-self.loss_free_bias_state.mean())
@@ -458,7 +458,7 @@ class MoE(nn.Module):
 
         probs_flat = probs.reshape(BT, -1)
         gate_flat = gate.reshape(BT, self.top_k)  # Now always (BT, k)
-        idx_flat = topk_idx.reshape(BT, self.top_k)        
+        idx_flat = topk_idx.reshape(BT, self.top_k)
         for expert_id in range(self.num_experts):
             sel_mask = (idx_flat == expert_id)
             token_rows, which_k = torch.nonzero(sel_mask, as_tuple=True)
@@ -986,6 +986,8 @@ group.add_argument('--use_adamw_opt3', action='store_true', default=False,
                    help='use AdamW instead of Muon for transformer blocks')
 group.add_argument('--use_adamw_router', action='store_true', default=False,
                    help='optimize router parameters with AdamW instead of Muon (requires learned routers)')
+group.add_argument('--muon-svd-backend', default='newtonschulz5', type=str, choices=['newtonschulz5', 'svd'],
+                   help='Method to use to calculate svd for muon')
 
 # Learning rate parameters
 group = parser.add_argument_group('Learning rate parameters')
@@ -1166,7 +1168,7 @@ else:
             router_optimizer = torch.optim.AdamW(router_params, lr=args.lr_muon, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
         elif master_process:
             logging.warning("AdamW router optimization requested, but no router parameters were found.")
-    optimizer3 = Muon(muon_params, lr=args.lr_muon, momentum=args.momentum)
+    optimizer3 = Muon(muon_params, lr=args.lr_muon, momentum=args.momentum, backend=args.muon_svd_backend)
 optimizers = [optimizer1, optimizer2, optimizer3]
 if router_optimizer is not None:
     optimizers.append(router_optimizer)

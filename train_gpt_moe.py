@@ -257,6 +257,24 @@ def maxvio_per_layer(balance_tensor: torch.Tensor) -> torch.Tensor:
     return (per_layer_max - expected_frac) / expected_frac
 
 
+ROUTER_VALUE_KEYS = (
+    'top1_logit',
+    'top2_logit',
+    'logit_diff',
+    'top1_coef',
+    'top2_coef',
+    'coef_diff',
+)
+
+
+def init_layer_router_value_tensors(n_layers, device):
+    return {key: torch.zeros(n_layers, device=device, dtype=torch.float32) for key in ROUTER_VALUE_KEYS}
+
+
+def init_total_router_value_tensors(device):
+    return {key: torch.tensor(0.0, device=device, dtype=torch.float32) for key in ROUTER_VALUE_KEYS}
+
+
 class ReLUSquared(nn.Module):
     def forward(self, x):
         return torch.relu(x).square()
@@ -478,6 +496,37 @@ class MoE(nn.Module):
 
         y = y_flat.view_as(x)
 
+        with torch.no_grad():
+            gate_stats = gate_flat.float()
+            top1_coef_vals = gate_stats[:, 0]
+            if gate_stats.size(1) >= 2:
+                top2_coef_vals = gate_stats[:, 1]
+            else:
+                top2_coef_vals = torch.zeros_like(top1_coef_vals)
+
+            if logits_for_selection is not None:
+                logits_flat = logits_for_selection.reshape(BT, self.num_experts).float()
+                num_top_logits = 2 if logits_flat.size(1) >= 2 else 1
+                top_logits = torch.topk(logits_flat, k=num_top_logits, dim=-1).values
+                top1_logits_vals = top_logits[:, 0]
+                if num_top_logits == 2:
+                    top2_logits_vals = top_logits[:, 1]
+                else:
+                    top2_logits_vals = torch.zeros_like(top1_logits_vals)
+            else:
+                zero_vals = torch.zeros(BT, device=x.device, dtype=torch.float32)
+                top1_logits_vals = zero_vals
+                top2_logits_vals = zero_vals
+
+            router_value_stats = {
+                'top1_logit': top1_logits_vals.mean(),
+                'top2_logit': top2_logits_vals.mean(),
+                'logit_diff': (top1_logits_vals - top2_logits_vals).mean(),
+                'top1_coef': top1_coef_vals.mean(),
+                'top2_coef': top2_coef_vals.mean(),
+                'coef_diff': (top1_coef_vals - top2_coef_vals).mean(),
+            }
+
         # aux loss and router statistics
         with torch.autocast(device_type="cpu", enabled=False):
             tokens_per_expert = torch.bincount(
@@ -521,9 +570,9 @@ class MoE(nn.Module):
                 raise ValueError(f"unknown routing type: {self.router_type}")
 
         if return_expert_assignments:
-            return y, aux, router_entropy, frac, topk_idx.view_as(x[:, :, :self.top_k])
+            return y, aux, router_entropy, frac, router_value_stats, topk_idx.view_as(x[:, :, :self.top_k])
         else:
-            return y, aux, router_entropy, frac
+            return y, aux, router_entropy, frac, router_value_stats
 
 
 class Block(nn.Module):
@@ -567,13 +616,17 @@ class Block(nn.Module):
     def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None):
         x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
         if return_expert_assignments:
-            mlp_out, aux, router_entropy, expert_balance, expert_assignments = self.mlp(F.rms_norm(x, (x.size(-1),)), token_idx, return_expert_assignments=True, router_context=router_context)
+            mlp_out, aux, router_entropy, expert_balance, router_value_stats, expert_assignments = self.mlp(
+                F.rms_norm(x, (x.size(-1),)), token_idx, return_expert_assignments=True, router_context=router_context
+            )
             x = x + mlp_out
-            return x, aux, router_entropy, expert_balance, expert_assignments
+            return x, aux, router_entropy, expert_balance, router_value_stats, expert_assignments
         else:
-            mlp_out, aux, router_entropy, expert_balance = self.mlp(F.rms_norm(x, (x.size(-1),)), token_idx, router_context=router_context)
+            mlp_out, aux, router_entropy, expert_balance, router_value_stats = self.mlp(
+                F.rms_norm(x, (x.size(-1),)), token_idx, router_context=router_context
+            )
             x = x + mlp_out
-            return x, aux, router_entropy, expert_balance
+            return x, aux, router_entropy, expert_balance, router_value_stats
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
@@ -639,12 +692,17 @@ class GPT(nn.Module):
         per_layer_router_entropy = []
         per_layer_expert_balance = []
         all_layer_expert_assignments = []
+        per_layer_router_values = []
         for block in self.transformer.h:
             if return_expert_assignments:
-                x, aux, router_entropy, expert_balance, expert_assignments = block(x, idx, return_expert_assignments=True, router_context=router_context)
+                x, aux, router_entropy, expert_balance, router_value_stats, expert_assignments = block(
+                    x, idx, return_expert_assignments=True, router_context=router_context
+                )
                 all_layer_expert_assignments.append(expert_assignments)
             else:
-                x, aux, router_entropy, expert_balance = block(x, idx, router_context=router_context)
+                x, aux, router_entropy, expert_balance, router_value_stats = block(
+                    x, idx, router_context=router_context
+                )
             total_aux = total_aux + aux
             total_router_entropy = total_router_entropy + router_entropy
             if total_expert_balance is None:
@@ -653,6 +711,7 @@ class GPT(nn.Module):
                 total_expert_balance = total_expert_balance + expert_balance
             per_layer_router_entropy.append(router_entropy)
             per_layer_expert_balance.append(expert_balance)
+            per_layer_router_values.append(router_value_stats)
         x = F.rms_norm(x, (x.size(-1),))
 
         # average stats across blocks
@@ -661,6 +720,11 @@ class GPT(nn.Module):
         avg_expert_balance = total_expert_balance / num_blocks
         layer_router_entropy = torch.stack(per_layer_router_entropy)
         layer_expert_balance = torch.stack(per_layer_expert_balance, dim=0)
+        layer_router_values = {
+            key: torch.stack([layer_stats[key] for layer_stats in per_layer_router_values])
+            for key in ROUTER_VALUE_KEYS
+        }
+        avg_router_values = {key: layer_router_values[key].mean() for key in ROUTER_VALUE_KEYS}
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
@@ -682,9 +746,32 @@ class GPT(nn.Module):
         if return_expert_assignments:
             # Stack assignments: shape (n_layers, batch, seq_len, top_k)
             stacked_assignments = torch.stack(all_layer_expert_assignments, dim=0)
-            return logits, loss, ce_loss, total_aux, avg_router_entropy, avg_expert_balance, layer_router_entropy, layer_expert_balance, stacked_assignments
+            return (
+                logits,
+                loss,
+                ce_loss,
+                total_aux,
+                avg_router_entropy,
+                avg_expert_balance,
+                layer_router_entropy,
+                layer_expert_balance,
+                layer_router_values,
+                avg_router_values,
+                stacked_assignments,
+            )
         else:
-            return logits, loss, ce_loss, total_aux, avg_router_entropy, avg_expert_balance, layer_router_entropy, layer_expert_balance
+            return (
+                logits,
+                loss,
+                ce_loss,
+                total_aux,
+                avg_router_entropy,
+                avg_expert_balance,
+                layer_router_entropy,
+                layer_expert_balance,
+                layer_router_values,
+                avg_router_values,
+            )
 
     def finalize_loss_free_updates(self):
         for block in self.transformer.h:
@@ -1410,11 +1497,24 @@ for step in range(start_step, args.num_iterations + 1):
         n_layers = raw_model.config.n_layer
         val_layer_router_entropy = torch.zeros(n_layers, device=device)
         val_layer_expert_balance = torch.zeros(n_layers, num_experts, device=device)
+        val_layer_router_values = init_layer_router_value_tensors(n_layers, device=device)
+        val_total_router_values = init_total_router_value_tensors(device=device)
         for _ in range(val_steps):
             x_val, y_val = val_loader.next_batch()
             with torch.no_grad():
                 with ctx:
-                    _, loss, ce_loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(x_val, y_val, return_logits=False, aux_coeff=args.aux_coeff_val)
+                    (
+                        _,
+                        loss,
+                        ce_loss,
+                        total_aux,
+                        router_entropy,
+                        expert_balance,
+                        layer_router_entropy,
+                        layer_expert_balance,
+                        layer_router_values,
+                        total_router_values,
+                    ) = model(x_val, y_val, return_logits=False, aux_coeff=args.aux_coeff_val)
                     val_loss += loss.detach()
                     val_ce_loss += ce_loss.detach()
                     val_aux_loss += total_aux.detach()
@@ -1422,6 +1522,9 @@ for step in range(start_step, args.num_iterations + 1):
                     val_expert_balance = val_expert_balance + expert_balance.detach()
                     val_layer_router_entropy = val_layer_router_entropy + layer_router_entropy.detach()
                     val_layer_expert_balance = val_layer_expert_balance + layer_expert_balance.detach()
+                    for key in ROUTER_VALUE_KEYS:
+                        val_layer_router_values[key] = val_layer_router_values[key] + layer_router_values[key].detach()
+                        val_total_router_values[key] = val_total_router_values[key] + total_router_values[key].detach()
                     del loss, ce_loss
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         dist.all_reduce(val_ce_loss, op=dist.ReduceOp.AVG)
@@ -1434,10 +1537,16 @@ for step in range(start_step, args.num_iterations + 1):
         val_expert_balance = val_expert_balance / val_steps
         val_layer_router_entropy = val_layer_router_entropy / val_steps
         val_layer_expert_balance = val_layer_expert_balance / val_steps
+        for key in ROUTER_VALUE_KEYS:
+            val_layer_router_values[key] = val_layer_router_values[key] / val_steps
+            val_total_router_values[key] = val_total_router_values[key] / val_steps
         dist.all_reduce(val_router_entropy, op=dist.ReduceOp.AVG)
         dist.all_reduce(val_expert_balance, op=dist.ReduceOp.AVG)
         dist.all_reduce(val_layer_router_entropy, op=dist.ReduceOp.AVG)
         dist.all_reduce(val_layer_expert_balance, op=dist.ReduceOp.AVG)
+        for key in ROUTER_VALUE_KEYS:
+            dist.all_reduce(val_layer_router_values[key], op=dist.ReduceOp.AVG)
+            dist.all_reduce(val_total_router_values[key], op=dist.ReduceOp.AVG)
         # log val loss to console and to logfile
         if master_process:
             logging.info(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
@@ -1452,7 +1561,9 @@ for step in range(start_step, args.num_iterations + 1):
         model.zero_grad(set_to_none=True)
         gc.collect()
         with ctx:
-            _, loss_ce, ce_loss_probe, total_aux_probe, _, _, _, _ = model(x_probe, y_probe, return_logits=False, aux_coeff=0.0)
+            _, loss_ce, ce_loss_probe, total_aux_probe, _, _, _, _, _, _ = model(
+                x_probe, y_probe, return_logits=False, aux_coeff=0.0
+            )
         loss_ce.backward()
         ce_router_layer_grad_norms = []
         for li in range(raw_model.config.n_layer):
@@ -1468,7 +1579,7 @@ for step in range(start_step, args.num_iterations + 1):
         model.zero_grad(set_to_none=True)
         gc.collect()
         with ctx:
-            _, _, _, total_aux_probe, _, _, _, _ = model(x_probe, y_probe, return_logits=False, aux_coeff=0.0)
+            _, _, _, total_aux_probe, _, _, _, _, _, _ = model(x_probe, y_probe, return_logits=False, aux_coeff=0.0)
         # Backprop aux explicitly
         total_aux_probe.backward()
         aux_router_layer_grad_norms = []
@@ -1493,7 +1604,9 @@ for step in range(start_step, args.num_iterations + 1):
             with torch.no_grad():
                 with ctx:
                     # Get current expert assignments for tracking sequences
-                    _, _, _, _, _, _, _, _, current_assignments = model(tracking_x, return_logits=False, aux_coeff=0.0, return_expert_assignments=True)
+                    _, _, _, _, _, _, _, _, _, _, current_assignments = model(
+                        tracking_x, return_logits=False, aux_coeff=0.0, return_expert_assignments=True
+                    )
                     # current_assignments shape: (n_layers, 100, seq_len, top_k)
                     sorted_curr_assignments = current_assignments.clone().sort(dim=-1)[0]
                     
@@ -1532,7 +1645,9 @@ for step in range(start_step, args.num_iterations + 1):
             with torch.no_grad():
                 with ctx:
                     # Get expert assignments for all tracked sequences
-                    _, _, _, _, _, _, _, _, all_assignments = model(tracking_x, return_logits=False, aux_coeff=0.0, return_expert_assignments=True)
+                    _, _, _, _, _, _, _, _, _, _, all_assignments = model(
+                        tracking_x, return_logits=False, aux_coeff=0.0, return_expert_assignments=True
+                    )
                     # all_assignments shape: (n_layers, n_tracked_seq, seq_len, top_k)
                     
                     # Create matrices for each tracked token
@@ -1622,12 +1737,16 @@ for step in range(start_step, args.num_iterations + 1):
                 wandb_log[f'val/MaxVioglobal/Layer {li}'] = float(val_maxvio_layers_cpu[li].item())
                 for ei in range(num_experts):
                     wandb_log[f'Expert Balance/Layer {li}/{ei}'] = float(val_layer_expert_balance[li, ei].item())
+                for key in ROUTER_VALUE_KEYS:
+                    wandb_log[f'router_values/layer_{li}_{key}'] = float(val_layer_router_values[key][li].item())
                 mlp = raw_model.transformer.h[li].mlp
                 bias_vec = mlp._loss_free_bias_vector()
                 if bias_vec is not None:
                     bias_vals = bias_vec.detach().float().cpu()
                     for ei in range(mlp.num_experts):
                         wandb_log[f'val_loss_free_bias/Layer {li}/expert_{ei}'] = float(bias_vals[ei].item())
+            for key in ROUTER_VALUE_KEYS:
+                wandb_log[f'router_values/total_{key}'] = float(val_total_router_values[key].item())
             wandb_log['train/time_ms'] = float(training_time_ms)
             wandb_log['train/step_avg_ms'] = float(training_time_ms/(timed_steps-1))
             wandb.log(wandb_log, step=step)
@@ -1696,6 +1815,8 @@ for step in range(start_step, args.num_iterations + 1):
     expert_balance_sum = torch.zeros(num_experts, device=device)
     layer_router_entropy_sum = torch.zeros(n_layers, device=device)
     layer_expert_balance_sum = torch.zeros(n_layers, num_experts, device=device)
+    layer_router_values_sum = init_layer_router_value_tensors(n_layers, device=device)
+    total_router_values_sum = init_total_router_value_tensors(device=device)
     for i in range(1, train_accumulation_steps+1):
         if use_global_lb:
             x_batch, y_batch = cached_batches[i-1]
@@ -1703,7 +1824,18 @@ for step in range(start_step, args.num_iterations + 1):
             x_batch, y_batch = x, y
         # forward pass
         with ctx:
-            _, loss, ce_loss, total_aux, router_entropy, expert_balance, layer_router_entropy, layer_expert_balance = model(
+            (
+                _,
+                loss,
+                ce_loss,
+                total_aux,
+                router_entropy,
+                expert_balance,
+                layer_router_entropy,
+                layer_expert_balance,
+                layer_router_values,
+                total_router_values,
+            ) = model(
                 x_batch, y_batch, return_logits=False, aux_coeff=args.aux_coeff_train, router_context=router_context_use
             )
             train_loss = loss.detach()
@@ -1711,6 +1843,9 @@ for step in range(start_step, args.num_iterations + 1):
             expert_balance_sum = expert_balance_sum + expert_balance.detach()
             layer_router_entropy_sum = layer_router_entropy_sum + layer_router_entropy.detach()
             layer_expert_balance_sum = layer_expert_balance_sum + layer_expert_balance.detach()
+            for key in ROUTER_VALUE_KEYS:
+                layer_router_values_sum[key] = layer_router_values_sum[key] + layer_router_values[key].detach()
+                total_router_values_sum[key] = total_router_values_sum[key] + total_router_values[key].detach()
         if not use_global_lb:
             # advance the dataset for the next batch
             x, y = train_loader.next_batch()
@@ -1740,10 +1875,19 @@ for step in range(start_step, args.num_iterations + 1):
     expert_balance_avg = expert_balance_sum / train_accumulation_steps
     layer_router_entropy_avg = layer_router_entropy_sum / train_accumulation_steps
     layer_expert_balance_avg = layer_expert_balance_sum / train_accumulation_steps
+    layer_router_values_avg = {
+        key: layer_router_values_sum[key] / train_accumulation_steps for key in ROUTER_VALUE_KEYS
+    }
+    total_router_values_avg = {
+        key: total_router_values_sum[key] / train_accumulation_steps for key in ROUTER_VALUE_KEYS
+    }
     dist.all_reduce(router_entropy_avg, op=dist.ReduceOp.AVG)
     dist.all_reduce(expert_balance_avg, op=dist.ReduceOp.AVG)
     dist.all_reduce(layer_router_entropy_avg, op=dist.ReduceOp.AVG)
     dist.all_reduce(layer_expert_balance_avg, op=dist.ReduceOp.AVG)
+    for key in ROUTER_VALUE_KEYS:
+        dist.all_reduce(layer_router_values_avg[key], op=dist.ReduceOp.AVG)
+        dist.all_reduce(total_router_values_avg[key], op=dist.ReduceOp.AVG)
 
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
@@ -1790,12 +1934,16 @@ for step in range(start_step, args.num_iterations + 1):
             wandb_log[f'train/MaxViobatch/Layer {li}'] = float(train_maxvio_layers_cpu[li].item())
             for ei in range(num_experts):
                 wandb_log[f'Expert Balance/Layer {li}/{ei}'] = float(layer_expert_balance_avg[li, ei].item())
+            for key in ROUTER_VALUE_KEYS:
+                wandb_log[f'router_values/layer_{li}_{key}'] = float(layer_router_values_avg[key][li].item())
             mlp = raw_model.transformer.h[li].mlp
             bias_vec = mlp._loss_free_bias_vector()
             if bias_vec is not None:
                 bias_vals = bias_vec.detach().float().cpu()
                 for ei in range(mlp.num_experts):
                     wandb_log[f'train_loss_free_bias/Layer {li}/expert_{ei}'] = float(bias_vals[ei].item())
+        for key in ROUTER_VALUE_KEYS:
+            wandb_log[f'router_values/total_{key}'] = float(total_router_values_avg[key].item())
         wandb.log(wandb_log, step=step+1)
 
 if master_process:

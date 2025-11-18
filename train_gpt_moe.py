@@ -986,6 +986,8 @@ group.add_argument('--use_adamw_opt3', action='store_true', default=False,
                    help='use AdamW instead of Muon for transformer blocks')
 group.add_argument('--use_adamw_router', action='store_true', default=False,
                    help='optimize router parameters with AdamW instead of Muon (requires learned routers)')
+group.add_argument('--only-router-muon', action='store_true', default=False,
+                   help='use Muon only for router parameters and AdamW for the rest of the transformer blocks')
 group.add_argument('--muon-svd-backend', default='newtonschulz5', type=str, choices=['newtonschulz5', 'svd'],
                    help='Method to use to calculate svd for muon')
 
@@ -1042,6 +1044,11 @@ def _parse_args():
     # The main arg parser parses the rest of the args, the usual
     # defaults will have been overridden if config file specified.
     args = parser.parse_args(remaining)
+
+    if args.only_router_muon and args.use_adamw_router:
+        parser.error("--only-router-muon cannot be combined with --use_adamw_router")
+    if args.only_router_muon and args.use_adamw_opt3:
+        parser.error("--only-router-muon cannot be combined with --use_adamw_opt3")
 
     # Cache the args as a text string to save them in the output dir later
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
@@ -1152,23 +1159,32 @@ optimizer1 = torch.optim.AdamW([raw_model.transformer.wte.weight], lr=args.lr_em
 optimizer2 = torch.optim.AdamW([raw_model.lm_head.weight], lr=args.lr_head, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
 router_optimizer = None
 
-if args.use_adamw_opt3:
+def _collect_router_params():
+    router_params_local = []
+    for block in raw_model.transformer.h:
+        router_module = getattr(block.mlp, 'router', None)
+        if router_module is not None:
+            router_params_local.extend(list(router_module.parameters()))
+    return router_params_local
+
+if args.only_router_muon:
+    router_params = _collect_router_params()
+    router_optimizer = Muon(router_params, lr=args.lr_muon, momentum=args.momentum, backend=args.muon_svd_backend)
+    router_param_ids = {id(p) for p in router_params}
+    blocks_params = [p for p in all_h_params if id(p) not in router_param_ids]
+
+    optimizer3 = torch.optim.AdamW(blocks_params, lr=6e-4, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
+elif args.use_adamw_opt3:
     optimizer3 = torch.optim.AdamW(all_h_params, lr=6e-4, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
-else:
-    muon_params = all_h_params
-    if args.use_adamw_router:
-        router_params = []
-        for block in raw_model.transformer.h:
-            router_module = getattr(block.mlp, 'router', None)
-            if router_module is not None:
-                router_params.extend(list(router_module.parameters()))
-        if router_params:
-            router_param_ids = {id(p) for p in router_params}
-            muon_params = [p for p in all_h_params if id(p) not in router_param_ids]
-            router_optimizer = torch.optim.AdamW(router_params, lr=args.lr_muon, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
-        elif master_process:
-            logging.warning("AdamW router optimization requested, but no router parameters were found.")
+elif args.use_adamw_router:
+    router_params = _collect_router_params()
+    router_optimizer = torch.optim.AdamW(router_params, lr=args.lr_muon, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
+    router_param_ids = {id(p) for p in router_params}
+    muon_params = [p for p in all_h_params if id(p) not in router_param_ids]
+    
     optimizer3 = Muon(muon_params, lr=args.lr_muon, momentum=args.momentum, backend=args.muon_svd_backend)
+else:
+    optimizer3 = Muon(all_h_params, lr=args.lr_muon, momentum=args.momentum, backend=args.muon_svd_backend)
 optimizers = [optimizer1, optimizer2, optimizer3]
 if router_optimizer is not None:
     optimizers.append(router_optimizer)
@@ -1242,6 +1258,8 @@ if master_process:
     
     # Create config from args and add computed/runtime information
     config = vars(args).copy()  # Convert args to dict
+    blocks_group = optimizer3.param_groups[0]
+    is_blocks_muon = isinstance(optimizer3, Muon)
     config.update({
         'train_accumulation_steps': train_accumulation_steps,
         'val_steps': val_steps,
@@ -1264,21 +1282,43 @@ if master_process:
         'optimizer_head_lr': optimizer2.param_groups[0]['lr'],
         'optimizer_head_betas': tuple(optimizer2.param_groups[0]['betas']),
         'optimizer_head_fused': bool(optimizer2.param_groups[0].get('fused', False)),
-        'optimizer_muon_lr': optimizer3.param_groups[0]['lr'],
-        'optimizer_muon_momentum': optimizer3.defaults.get('momentum', None),
-        'optimizer_muon_nesterov': optimizer3.defaults.get('nesterov', None),
-        'optimizer_muon_backend': optimizer3.defaults.get('backend', None),
-        'optimizer_muon_backend_steps': optimizer3.defaults.get('backend_steps', None),
+        'optimizer_blocks_type': optimizer3.__class__.__name__,
+        'optimizer_blocks_lr': blocks_group['lr'],
+        'optimizer_blocks_betas': tuple(blocks_group['betas']) if 'betas' in blocks_group else None,
+        'optimizer_blocks_fused': bool(blocks_group.get('fused', False)),
+        'optimizer_muon_lr': blocks_group['lr'] if is_blocks_muon else None,
+        'optimizer_muon_momentum': optimizer3.defaults.get('momentum', None) if is_blocks_muon else None,
+        'optimizer_muon_nesterov': optimizer3.defaults.get('nesterov', None) if is_blocks_muon else None,
+        'optimizer_muon_backend': optimizer3.defaults.get('backend', None) if is_blocks_muon else None,
+        'optimizer_muon_backend_steps': optimizer3.defaults.get('backend_steps', None) if is_blocks_muon else None,
         'amp_dtype': 'bfloat16',
         'torch_compile': True,
         'attention_backend': 'cudnn_sdp',
     })
     if router_optimizer is not None:
-        config.update({
-            'optimizer_router_lr': router_optimizer.param_groups[0]['lr'],
-            'optimizer_router_betas': tuple(router_optimizer.param_groups[0]['betas']),
-            'optimizer_router_fused': bool(router_optimizer.param_groups[0].get('fused', False)),
-        })
+        router_group = router_optimizer.param_groups[0]
+        router_is_muon = isinstance(router_optimizer, Muon)
+        router_config = {
+            'optimizer_router_type': router_optimizer.__class__.__name__,
+            'optimizer_router_lr': router_group['lr'],
+            'optimizer_router_betas': tuple(router_group['betas']) if 'betas' in router_group else None,
+            'optimizer_router_fused': bool(router_group.get('fused', False)),
+        }
+        if router_is_muon:
+            router_config.update({
+                'optimizer_router_muon_momentum': router_optimizer.defaults.get('momentum', None),
+                'optimizer_router_muon_nesterov': router_optimizer.defaults.get('nesterov', None),
+                'optimizer_router_muon_backend': router_optimizer.defaults.get('backend', None),
+                'optimizer_router_muon_backend_steps': router_optimizer.defaults.get('backend_steps', None),
+            })
+        else:
+            router_config.update({
+                'optimizer_router_muon_momentum': None,
+                'optimizer_router_muon_nesterov': None,
+                'optimizer_router_muon_backend': None,
+                'optimizer_router_muon_backend_steps': None,
+            })
+        config.update(router_config)
     
     run_name = os.path.basename(args.output)
     # group seeds

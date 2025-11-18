@@ -277,6 +277,7 @@ class MoE(nn.Module):
         loss_free_strength=1.0,
         loss_free_update_rate=0.001,
         loss_free_bias_rule='ema',
+        router_logit_jitter=0.0,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -292,11 +293,13 @@ class MoE(nn.Module):
         self.loss_free_strength = loss_free_strength
         self.loss_free_update_rate = loss_free_update_rate
         self.loss_free_bias_rule = loss_free_bias_rule
+        self.router_logit_jitter = router_logit_jitter
 
         assert self.router_type in ('hash', 'switch', 'diff')
         assert self.router_activation in ('gelu', 'relu', 'relu_squared')
         assert self.loss_free_mode in ('none', 'deepseek', 'stopgrad')
         assert self.loss_free_bias_rule in ('ema', 'sign')
+        assert self.router_logit_jitter >= 0.0, "router_logit_jitter must be non-negative"
         if self.router_type == 'hash' and self.loss_free_mode != 'none':
             raise ValueError("Loss-free load balancing requires a learned router (switch or diff).")
         if self.loss_free_mode == 'deepseek' and self.router_type != 'switch':
@@ -421,6 +424,12 @@ class MoE(nn.Module):
         logits_for_stats = None
         if self.router_type in ("switch", "diff"):
             logits = self.router(x)
+            if self.training and self.router_logit_jitter > 0.0:
+                noise = torch.empty_like(logits).uniform_(
+                    1.0 - self.router_logit_jitter,
+                    1.0 + self.router_logit_jitter,
+                )
+                logits = logits * noise
             bias = self._loss_free_bias(logits)
             if self.loss_free_mode == 'deepseek' and bias is not None:
                 logits_for_selection = logits + bias
@@ -534,6 +543,7 @@ class Block(nn.Module):
         loss_free_strength=1.0,
         loss_free_update_rate=0.001,
         loss_free_bias_rule='ema',
+        router_logit_jitter=0.0,
     ):
         super().__init__()
         self.attn = CausalSelfAttention(config)
@@ -551,6 +561,7 @@ class Block(nn.Module):
             loss_free_strength=loss_free_strength,
             loss_free_update_rate=loss_free_update_rate,
             loss_free_bias_rule=loss_free_bias_rule,
+            router_logit_jitter=router_logit_jitter,
         )
 
     def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None):
@@ -584,6 +595,7 @@ class GPTConfig:
     loss_free_strength : float = 1.0
     loss_free_update_rate : float = 0.001
     loss_free_bias_rule : str = 'ema'
+    router_logit_jitter : float = 0.0
 
 class GPT(nn.Module):
 
@@ -608,6 +620,7 @@ class GPT(nn.Module):
                     loss_free_strength=config.loss_free_strength,
                     loss_free_update_rate=config.loss_free_update_rate,
                     loss_free_bias_rule=config.loss_free_bias_rule,
+                    router_logit_jitter=config.router_logit_jitter,
                 )
                 for layer_idx in range(config.n_layer)
             ]),
@@ -965,6 +978,8 @@ group.add_argument('--loss-free-update-rate', default=0.001, type=float,
                    help='per-expert bias update rate for sign-based loss-free routing')
 group.add_argument('--loss-free-bias-rule', default='ema', type=str, choices=['ema', 'sign'],
                    help='controls whether router bias uses EMA or sign-step updates')
+group.add_argument('--router-logit-jitter', default=0.0, type=float,
+                   help='uniform multiplicative noise width applied to router logits during training (e.g., 1e-2 matches ST-MoE input jitter)')
 
 # Optimization parameters
 group = parser.add_argument_group('Optimization parameters')
@@ -1131,6 +1146,7 @@ model = GPT(GPTConfig(
     loss_free_strength=args.loss_free_strength,
     loss_free_update_rate=args.loss_free_update_rate,
     loss_free_bias_rule=args.loss_free_bias_rule,
+    router_logit_jitter=args.router_logit_jitter,
 ))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):

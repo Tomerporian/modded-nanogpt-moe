@@ -53,16 +53,11 @@ parameters:
   device_0: [true]
   seed: [1000]
 
-
-  aux_coeff_train: [0.0]
-  aux_coeff_val: [0.0]
+  router_type: ['switch', 'diff']
+  router_logit_jitter: [0.01, 0.1, 0.5]
 
   LIST_TESTS:
-    - loss_free_mode: ['deepseek']
-      router_type: ['switch']
-      loss_free_bias_rule: ['sign']
-      loss_free_update_rate: [0.1, 0.01, 0.001]
-    - loss_free_mode: ['stopgrad']
-      router_type: ['switch', 'diff']
-      loss_free_bias_rule: ['sign']
-      loss_free_update_rate: [0.1, 0.01, 0.001]
+    - aux_coeff_train: [0.1]
+      aux_coeff_val: [0.1]
+    - aux_coeff_train: [0.01]
+      aux_coeff_val: [0.01]

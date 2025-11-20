@@ -8,8 +8,6 @@ import time
 from dataclasses import dataclass
 import math
 import gc
-import argparse
-import yaml
 import logging
 import warnings
 import random
@@ -28,112 +26,12 @@ import torch._inductor.config as config
 import torch._dynamo as dynamo
 from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
+from params import parse_args
+from optimizers import Muon
+from logger import setup_default_logging
 
 # Import Megatron dataloader for indexed datasets
 from megatron_indexed_dataset import MegatronDataLoader
-
-# -----------------------------------------------------------------------------
-# Muon optimizer
-
-def zeropower_via_svd(G, steps=None):
-    U, S, V = G.svd()
-    return U @ V.T
-
-@torch.compile
-def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' \\ sim Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
-    assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750,  2.0315)
-    X = G.bfloat16()
-    X /= (X.norm() + eps) # ensure top singular value <= 1
-    if G.size(0) > G.size(1):
-        X = X.T
-    for _ in range(steps):
-        A = X @ X.T
-        B = A @ X
-        X = a * X + b * B + c * A @ B
-    if G.size(0) > G.size(1):
-        X = X.T
-    return X
-
-zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
-
-class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Some warnings:
-    - This optimizer assumes that all parameters passed in are 2D.
-    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
-    parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
-    - We believe it is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
-    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
-
-    Arguments:
-        lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
-        backend_steps: The number of iteration steps to use in the backend, if it is iterative.
-    """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
-                 backend='newtonschulz5', backend_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
-        super().__init__(params, defaults)
-
-    def step(self):
-
-        for group in self.param_groups:
-
-            lr = group['lr']
-            momentum = group['momentum']
-            zeropower_backend = zeropower_backends[group['backend']]
-
-            # generate weight updates in distributed fashion
-            total_params = sum(p.numel() for p in group['params'])
-            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
-            curr_idx = 0
-            for i, p in enumerate(group['params']):
-                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
-                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
-                    g = p.grad
-                    assert g is not None
-                    state = self.state[p]
-                    if 'momentum_buffer' not in state:
-                        state['momentum_buffer'] = torch.zeros_like(g)
-                    buf = state['momentum_buffer']
-                    buf.mul_(momentum).add_(g)
-                    if group['nesterov']:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(1, g.size(0)/g.size(1))**0.5
-                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
-                curr_idx += p.numel()
-
-            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
-            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-
-            # deserialize and apply updates
-            curr_idx = 0
-            for p in group['params']:
-                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
-                p.data.add_(g, alpha=-lr)
-                curr_idx += p.numel()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -157,14 +55,15 @@ class Rotary(torch.nn.Module):
             self.sin_cached = freqs.sin().bfloat16()
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
 
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4 # multihead attention
-    d = x.shape[3]//2
-    x1 = x[..., :d]
-    x2 = x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3).type_as(x)
+    @staticmethod
+    def apply_rotary_emb(x, cos, sin):
+        assert x.ndim == 4 # multihead attention
+        d = x.shape[3]//2
+        x1 = x[..., :d]
+        x2 = x[..., d:]
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat([y1, y2], 3).type_as(x)
 
 class CausalSelfAttention(nn.Module):
 
@@ -189,7 +88,8 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
         cos, sin = self.rotary(q)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q = Rotary.apply_rotary_emb(q, cos, sin)
+        k = Rotary.apply_rotary_emb(k, cos, sin)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
@@ -280,40 +180,23 @@ class ReLUSquared(nn.Module):
         return torch.relu(x).square()
 
 class MoE(nn.Module):
-    def __init__(
-        self,
-        config,
-        num_experts=8,
-        top_k=2,
-        router_type='diff',
-        router_depth=1,
-        router_activation='gelu',
-        global_load_balance=False,
-        layer_idx=0,
-        loss_free_mode='none',
-        loss_free_decay=0.99,
-        loss_free_strength=1.0,
-        loss_free_update_rate=0.001,
-        loss_free_bias_rule='ema',
-        router_logit_jitter=0.0,
-        use_router_temperature=False,
-    ):
+    def __init__(self, config, layer_idx=0):
         super().__init__()
-        self.num_experts = num_experts
-        self.top_k       = top_k
+        self.num_experts = config.num_experts
+        self.top_k = config.top_k
         assert 1 <= self.top_k <= self.num_experts, "`k` must be in [1, #experts]"
-        self.router_type  = router_type
-        self.router_depth = router_depth
-        self.router_activation = router_activation
-        self.global_load_balance = global_load_balance
+        self.router_type = config.router_type
+        self.router_depth = config.router_depth
+        self.router_activation = config.router_activation
+        self.global_load_balance = config.global_load_balance
         self.layer_idx = layer_idx
-        self.loss_free_mode = loss_free_mode
-        self.loss_free_decay = loss_free_decay
-        self.loss_free_strength = loss_free_strength
-        self.loss_free_update_rate = loss_free_update_rate
-        self.loss_free_bias_rule = loss_free_bias_rule
-        self.router_logit_jitter = router_logit_jitter
-        self.use_router_temperature = use_router_temperature
+        self.loss_free_mode = config.loss_free_mode
+        self.loss_free_decay = config.loss_free_decay
+        self.loss_free_strength = config.loss_free_strength
+        self.loss_free_update_rate = config.loss_free_update_rate
+        self.loss_free_bias_rule = config.loss_free_bias_rule
+        self.router_logit_jitter = config.router_logit_jitter
+        self.use_router_temperature = config.use_router_temperature
         if self.use_router_temperature:
             self.router_temperature_log = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         else:
@@ -339,7 +222,7 @@ class MoE(nn.Module):
         
         if self.router_type != 'hash':
             layers = []
-            for _ in range(router_depth - 1):
+            for _ in range(self.router_depth - 1):
                 layers.append(nn.Linear(config.n_embd, config.n_embd, bias=False))
                 layers.append(self._build_router_activation())
             layers.append(nn.Linear(config.n_embd, self.num_experts, bias=False))
@@ -595,43 +478,12 @@ class MoE(nn.Module):
 
 
 class Block(nn.Module):
-
-    def __init__(
-        self,
-        config,
-        num_experts=8,
-        top_k=2,
-        router_type='diff',
-        router_depth=1,
-        router_activation='gelu',
-        global_load_balance=False,
-        layer_idx=0,
-        loss_free_mode='none',
-        loss_free_decay=0.99,
-        loss_free_strength=1.0,
-        loss_free_update_rate=0.001,
-        loss_free_bias_rule='ema',
-        router_logit_jitter=0.0,
-        use_router_temperature=False,
-    ):
+    def __init__(self, config, layer_idx=0):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.mlp = MoE(
             config,
-            num_experts=num_experts,
-            top_k=top_k,
-            router_type=router_type,
-            router_depth=router_depth,
-            router_activation=router_activation,
-            global_load_balance=global_load_balance,
             layer_idx=layer_idx,
-            loss_free_mode=loss_free_mode,
-            loss_free_decay=loss_free_decay,
-            loss_free_strength=loss_free_strength,
-            loss_free_update_rate=loss_free_update_rate,
-            loss_free_bias_rule=loss_free_bias_rule,
-            router_logit_jitter=router_logit_jitter,
-            use_router_temperature=use_router_temperature,
         )
 
     def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None):
@@ -673,7 +525,6 @@ class GPTConfig:
     use_router_temperature : bool = False
 
 class GPT(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -681,23 +532,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([
-                Block(
-                    config,
-                    num_experts=config.num_experts,
-                    top_k=config.top_k,
-                    router_type=config.router_type,
-                    router_depth=config.router_depth,
-                    router_activation=config.router_activation,
-                    global_load_balance=config.global_load_balance,
-                    layer_idx=layer_idx,
-                    loss_free_mode=config.loss_free_mode,
-                    loss_free_decay=config.loss_free_decay,
-                    loss_free_strength=config.loss_free_strength,
-                    loss_free_update_rate=config.loss_free_update_rate,
-                    loss_free_bias_rule=config.loss_free_bias_rule,
-                    router_logit_jitter=config.router_logit_jitter,
-                    use_router_temperature=config.use_router_temperature,
-                )
+                Block(config, layer_idx=layer_idx)
                 for layer_idx in range(config.n_layer)
             ]),
         ))
@@ -1003,21 +838,8 @@ def create_dataloader(path_pattern, B, T, ddp_rank, ddp_world_size, split='train
         )
 
 
-def setup_default_logging(default_level=logging.INFO, log_path=''):
-    formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d,%H:%M:%S')
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logging.root.addHandler(console_handler)
-    logging.root.setLevel(default_level)
-    if log_path:
-        file_handler = logging.handlers.RotatingFileHandler(log_path, maxBytes=(1024 ** 2 * 2), backupCount=3)
-        file_formatter = logging.Formatter("%(asctime)s - %(name)20s: [%(levelname)8s] - %(message)s")
-        file_handler.setFormatter(file_formatter)
-        logging.root.addHandler(file_handler)
-
 setup_default_logging()
 
-_CKPT_REGEX = re.compile(r'state_step(\d+)\.pt')
 
 def find_latest_checkpoint(output_dir):
     """
@@ -1030,7 +852,8 @@ def find_latest_checkpoint(output_dir):
         return None
 
     def _ckpt_key(path):
-        match = _CKPT_REGEX.search(os.path.basename(path))
+        checkpoint_regex = re.compile(r'state_step(\d+)\.pt')
+        match = checkpoint_regex.search(os.path.basename(path))
         return int(match.group(1)) if match else -1
 
     latest = max(candidates, key=_ckpt_key)
@@ -1038,155 +861,12 @@ def find_latest_checkpoint(output_dir):
         return None
     return latest
 
-# -----------------------------------------------------------------------------
-# Argument parsing
-
-# The first arg parser parses out only the --config argument, this argument is used to
-# load a yaml file containing key-values that override the defaults for the main parser below
-config_parser = parser = argparse.ArgumentParser(description='Training Config', add_help=False)
-parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
-                    help='YAML config file specifying default arguments')
-
-parser = argparse.ArgumentParser(description='NanoGPT MoE Training')
-
-# Data parameters
-group = parser.add_argument_group('Data parameters')
-group.add_argument('--input-bin', default='data/fineweb10B/fineweb_train_*.bin', type=str,
-                   help='input .bin to train on')
-group.add_argument('--input-val-bin', default='data/fineweb10B/fineweb_val_*.bin', type=str,
-                   help='input .bin to eval validation loss on')
-
-# Model parameters
-group = parser.add_argument_group('Model parameters')
-group.add_argument('--vocab-size', default=50304, type=int,
-                   help='vocabulary size')
-group.add_argument('--n-layer', default=12, type=int,
-                   help='number of transformer layers')
-group.add_argument('--n-head', default=6, type=int,
-                   help='number of attention heads')
-group.add_argument('--n-embd', default=768, type=int,
-                   help='embedding dimension')
-group.add_argument('--num-experts', default=8, type=int,
-                   help='number of MoE experts')
-group.add_argument('--top-k', default=2, type=int,
-                   help='top-k experts to use')
-group.add_argument('--router-type', default='diff', type=str, choices=['switch', 'diff', 'hash'],
-                   help='router type for MoE')
-group.add_argument('--router-depth', default=1, type=int,
-                   help='number of layers in the router MLP for non-hash routing (hidden dim == input dim)')
-group.add_argument('--router-activation', default='gelu', type=str, choices=['gelu', 'relu', 'relu_squared'],
-                   help='activation to use between router MLP layers (if depth > 1)')
-group.add_argument('--global-load-balance', action='store_true', default=False,
-                   help='enable global batch load balancing for auxiliary router loss')
-group.add_argument('--loss-free-mode', default='none', type=str, choices=['none', 'deepseek', 'stopgrad'],
-                   help='loss-free router biasing strategy (deepseek for switch only, stopgrad supports switch/diff)')
-group.add_argument('--loss-free-decay', default=0.99, type=float,
-                   help='EMA decay for tracking per-layer expert usage in loss-free routing')
-group.add_argument('--loss-free-strength', default=1.0, type=float,
-                   help='scale factor applied to the loss-free routing bias')
-group.add_argument('--loss-free-update-rate', default=0.001, type=float,
-                   help='per-expert bias update rate for sign-based loss-free routing')
-group.add_argument('--loss-free-bias-rule', default='ema', type=str, choices=['ema', 'sign'],
-                   help='controls whether router bias uses EMA or sign-step updates')
-group.add_argument('--router-logit-jitter', default=0.0, type=float,
-                   help='uniform multiplicative noise width applied to router logits during training (e.g., 1e-2 matches ST-MoE input jitter)')
-group.add_argument('--use-router-temperature', action='store_true', default=False,
-                   help='enable a learnable router temperature (initialized to 1.0) applied to logits before routing')
-
-# Optimization parameters
-group = parser.add_argument_group('Optimization parameters')
-group.add_argument('--batch-size', default=8*64, type=int,
-                   help='batch size, in sequences, across all devices')
-group.add_argument('--device-batch-size', default=16, type=int,
-                   help='batch size, in sequences, per device')
-group.add_argument('--sequence-length', default=1024, type=int,
-                   help='sequence length, in tokens')
-group.add_argument('--num-iterations', default=4578, type=int,
-                   help='number of iterations to run')
-group.add_argument('--warmup-iters', default=0, type=int,
-                   help='number of warmup iterations')
-group.add_argument('--warmdown-iters', default=1308, type=int,
-                   help='number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule')
-group.add_argument('--weight-decay', default=0.0, type=float,
-                   help='weight decay')
-group.add_argument('--use_adamw_opt3', action='store_true', default=False,
-                   help='use AdamW instead of Muon for transformer blocks')
-group.add_argument('--use_adamw_router', action='store_true', default=False,
-                   help='optimize router parameters with AdamW instead of Muon (requires learned routers)')
-group.add_argument('--only-router-muon', action='store_true', default=False,
-                   help='use Muon only for router parameters and AdamW for the rest of the transformer blocks')
-group.add_argument('--muon-svd-backend', default='newtonschulz5', type=str, choices=['newtonschulz5', 'svd'],
-                   help='Method to use to calculate svd for muon')
-
-# Learning rate parameters
-group = parser.add_argument_group('Learning rate parameters')
-group.add_argument('--lr-embed', default=0.3, type=float,
-                   help='learning rate for embedding layer')
-group.add_argument('--lr-head', default=0.002, type=float,
-                   help='learning rate for head layer')
-group.add_argument('--lr-muon', default=0.02, type=float,
-                   help='learning rate for muon optimizer (transformer blocks)')
-group.add_argument('--momentum', default=0.95, type=float,
-                   help='momentum for muon optimizer')
-
-# Evaluation and logging parameters
-group = parser.add_argument_group('Evaluation and logging parameters')
-group.add_argument('--val-loss-every', default=125, type=int,
-                   help='every how many steps to evaluate val loss? 0 for only at the end')
-group.add_argument('--val-tokens', default=10485760, type=int,
-                   help='how many tokens of validation data? it\'s important to keep this fixed for consistent comparisons')
-group.add_argument('--save-every', default=0, type=int,
-                   help='every how many steps to save the checkpoint? 0 for only at the end')
-group.add_argument('--n-tracked-seq', default=100, type=int,
-                   help='number of sequences to track for expert assignment changes (0 to disable tracking)')
-group.add_argument('--wandb-project', default='modded-nanogpt-moe', type=str,
-                   help='wandb project name')
-group.add_argument('--output', default='logs', type=str,
-                   help='output directory for logs and checkpoints')
-
-# Loss parameters
-group = parser.add_argument_group('Loss parameters')
-group.add_argument('--aux-coeff-train', default=0.0, type=float,
-                   help='auxiliary loss coefficient for training')
-group.add_argument('--aux-coeff-val', default=0.0, type=float,
-                   help='auxiliary loss coefficient for validation')
-
-# Misc:
-group = parser.add_argument_group('Run config')
-group.add_argument('--device_0', action='store_true', default=False,
-                   help='Always use device=0')
-group.add_argument('--seed', type=int, default=42,
-                   help='random seed (default: 42)')
-group.add_argument('--resume', default='auto', type=str,
-                   help="checkpoint path to resume from, or 'auto' to load the newest checkpoint in --output")
-
-def _parse_args():
-    # Do we have a config file to parse?
-    args_config, remaining = config_parser.parse_known_args()
-    if args_config.config:
-        with open(args_config.config, 'r') as f:
-            cfg = yaml.safe_load(f)
-            parser.set_defaults(**cfg)
-
-    # The main arg parser parses the rest of the args, the usual
-    # defaults will have been overridden if config file specified.
-    args = parser.parse_args(remaining)
-
-    if args.only_router_muon and args.use_adamw_router:
-        parser.error("--only-router-muon cannot be combined with --use_adamw_router")
-    if args.only_router_muon and args.use_adamw_opt3:
-        parser.error("--only-router-muon cannot be combined with --use_adamw_opt3")
-
-    # Cache the args as a text string to save them in the output dir later
-    args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
-
-    return args, args_text
 
 # -----------------------------------------------------------------------------
 # int main
 
 # Parse command line arguments and config file  
-args, args_text = _parse_args()
+args, args_text = parse_args()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
@@ -1701,73 +1381,6 @@ for step in range(start_step, args.num_iterations + 1):
                     # Store current assignments for next comparison
                     prev_expert_assignments = current_assignments.clone()
                     sorted_prev_assignments = sorted_curr_assignments.clone()
-        
-        # Single token matrix tracking for wandb visualization
-        if master_process and tracked_token_positions is not None and tracking_x is not None:
-            model.eval()
-            with torch.no_grad():
-                with ctx:
-                    # Get expert assignments for all tracked sequences
-                    _, _, _, _, _, _, _, _, _, _, all_assignments = model(
-                        tracking_x, return_logits=False, aux_coeff=0.0, return_expert_assignments=True
-                    )
-                    # all_assignments shape: (n_layers, n_tracked_seq, seq_len, top_k)
-                    
-                    # Create matrices for each tracked token
-                    for token_idx, (seq_idx, pos_idx) in enumerate(tracked_token_positions):
-                        # Create matrix: rows = experts (0-7), cols = layers
-                        n_layers = all_assignments.shape[0]
-                        matrix = torch.zeros((num_experts, n_layers), dtype=torch.float32)
-                        
-                        # Fill matrix with expert assignments for this specific token
-                        for layer_idx in range(n_layers):
-                            # Get top-k experts chosen for this token in this layer
-                            chosen_experts = all_assignments[layer_idx, seq_idx, pos_idx, :]  # shape: (top_k,)
-                            # Mark chosen experts as 1
-                            for expert_id in chosen_experts:
-                                matrix[expert_id.item(), layer_idx] = 1.0
-                        
-                        # Log matrix as wandb Table for slider visualization
-                        token_id = tracking_x[seq_idx, pos_idx].item()
-                        matrix_data = matrix.cpu().numpy()
-                        
-                        # Create wandb Table with proper column/row labels
-                        columns = [f"Layer_{i}" for i in range(n_layers)]
-                        rows = [f"Expert_{i}" for i in range(num_experts)]
-                        
-                        # Convert matrix to list of lists for wandb
-                        matrix_list = [[float(matrix_data[row, col]) for col in range(n_layers)] for row in range(num_experts)]
-                        
-                        # Create wandb Image from matrix for visualization
-                        import matplotlib.pyplot as plt
-                        import matplotlib
-                        matplotlib.use('Agg')  # Non-interactive backend
-                        
-                        fig, ax = plt.subplots(figsize=(n_layers, num_experts))
-                        im = ax.imshow(matrix_data, cmap='Blues', aspect='auto')
-                        
-                        # Set labels
-                        ax.set_xticks(range(n_layers))
-                        ax.set_xticklabels(columns)
-                        ax.set_yticks(range(num_experts))
-                        ax.set_yticklabels(rows)
-                        
-                        # Add text annotations
-                        for i in range(num_experts):
-                            for j in range(n_layers):
-                                text = ax.text(j, i, f'{matrix_data[i, j]:.0f}',
-                                             ha="center", va="center", color="red" if matrix_data[i, j] > 0.5 else "black")
-                        
-                        ax.set_title(f'Token {token_idx} (ID: {token_id}) Expert Selection')
-                        ax.set_xlabel('Layers')
-                        ax.set_ylabel('Experts')
-                        plt.tight_layout()
-                        
-                        wandb.log({
-                            f"token_matrix/token_{token_idx}_id_{token_id}": wandb.Image(fig)
-                        }, step=step)
-                        
-                        plt.close(fig)
         
         # log to wandb
         if master_process:

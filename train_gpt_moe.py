@@ -296,6 +296,7 @@ class MoE(nn.Module):
         loss_free_update_rate=0.001,
         loss_free_bias_rule='ema',
         router_logit_jitter=0.0,
+        use_router_temperature=False,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -312,6 +313,11 @@ class MoE(nn.Module):
         self.loss_free_update_rate = loss_free_update_rate
         self.loss_free_bias_rule = loss_free_bias_rule
         self.router_logit_jitter = router_logit_jitter
+        self.use_router_temperature = use_router_temperature
+        if self.use_router_temperature:
+            self.router_temperature_log = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        else:
+            self.register_parameter('router_temperature_log', None)
 
         assert self.router_type in ('hash', 'switch', 'diff')
         assert self.router_activation in ('gelu', 'relu', 'relu_squared')
@@ -340,6 +346,14 @@ class MoE(nn.Module):
             self.router = nn.Sequential(*layers)
         else:
             self.router = None
+
+    def _get_router_temperature(self, reference_tensor):
+        if not self.use_router_temperature or self.router_temperature_log is None:
+            return None
+        temperature = torch.exp(self.router_temperature_log)
+        if reference_tensor is not None:
+            temperature = temperature.to(dtype=reference_tensor.dtype, device=reference_tensor.device)
+        return temperature
 
     def _build_router_activation(self):
         if self.router_activation == 'gelu':
@@ -459,6 +473,11 @@ class MoE(nn.Module):
             else:
                 logits_for_selection = logits
                 logits_for_weights = logits
+
+            if self.use_router_temperature:
+                temperature = self._get_router_temperature(logits_for_selection)
+                logits_for_selection = logits_for_selection / temperature
+                logits_for_weights = logits_for_weights / temperature
             logits_for_stats = logits_for_weights
         if self.router_type == "switch":
             router_probs = logits_for_stats.softmax(dim=-1)
@@ -593,6 +612,7 @@ class Block(nn.Module):
         loss_free_update_rate=0.001,
         loss_free_bias_rule='ema',
         router_logit_jitter=0.0,
+        use_router_temperature=False,
     ):
         super().__init__()
         self.attn = CausalSelfAttention(config)
@@ -611,6 +631,7 @@ class Block(nn.Module):
             loss_free_update_rate=loss_free_update_rate,
             loss_free_bias_rule=loss_free_bias_rule,
             router_logit_jitter=router_logit_jitter,
+            use_router_temperature=use_router_temperature,
         )
 
     def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None):
@@ -649,6 +670,7 @@ class GPTConfig:
     loss_free_update_rate : float = 0.001
     loss_free_bias_rule : str = 'ema'
     router_logit_jitter : float = 0.0
+    use_router_temperature : bool = False
 
 class GPT(nn.Module):
 
@@ -674,6 +696,7 @@ class GPT(nn.Module):
                     loss_free_update_rate=config.loss_free_update_rate,
                     loss_free_bias_rule=config.loss_free_bias_rule,
                     router_logit_jitter=config.router_logit_jitter,
+                    use_router_temperature=config.use_router_temperature,
                 )
                 for layer_idx in range(config.n_layer)
             ]),
@@ -1067,6 +1090,8 @@ group.add_argument('--loss-free-bias-rule', default='ema', type=str, choices=['e
                    help='controls whether router bias uses EMA or sign-step updates')
 group.add_argument('--router-logit-jitter', default=0.0, type=float,
                    help='uniform multiplicative noise width applied to router logits during training (e.g., 1e-2 matches ST-MoE input jitter)')
+group.add_argument('--use-router-temperature', action='store_true', default=False,
+                   help='enable a learnable router temperature (initialized to 1.0) applied to logits before routing')
 
 # Optimization parameters
 group = parser.add_argument_group('Optimization parameters')
@@ -1234,6 +1259,7 @@ model = GPT(GPTConfig(
     loss_free_update_rate=args.loss_free_update_rate,
     loss_free_bias_rule=args.loss_free_bias_rule,
     router_logit_jitter=args.router_logit_jitter,
+    use_router_temperature=args.use_router_temperature,
 ))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
@@ -1261,6 +1287,22 @@ all_h_params = list(raw_model.transformer.h.parameters())
 optimizer1 = torch.optim.AdamW([raw_model.transformer.wte.weight], lr=args.lr_embed, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
 optimizer2 = torch.optim.AdamW([raw_model.lm_head.weight], lr=args.lr_head, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
 router_optimizer = None
+router_temperature_optimizer = None
+
+def _collect_router_temperature_params():
+    temperature_params = []
+    if not raw_model.config.use_router_temperature:
+        return temperature_params
+    for block in raw_model.transformer.h:
+        temp_param = getattr(block.mlp, 'router_temperature_log', None)
+        if isinstance(temp_param, nn.Parameter):
+            temperature_params.append(temp_param)
+    return temperature_params
+
+router_temperature_params = _collect_router_temperature_params()
+if router_temperature_params:
+    temp_param_ids = {id(p) for p in router_temperature_params}
+    all_h_params = [p for p in all_h_params if id(p) not in temp_param_ids]
 
 def _collect_router_params():
     router_params_local = []
@@ -1269,6 +1311,16 @@ def _collect_router_params():
         if router_module is not None:
             router_params_local.extend(list(router_module.parameters()))
     return router_params_local
+
+def _append_router_temperature_logs(log_dict):
+    if not raw_model.config.use_router_temperature:
+        return
+    for li, block in enumerate(raw_model.transformer.h):
+        temp_param = getattr(block.mlp, 'router_temperature_log', None)
+        if temp_param is None:
+            continue
+        temp_value = torch.exp(temp_param.detach().float().cpu()).item()
+        log_dict[f'router_temperature/Layer {li}'] = float(temp_value)
 
 if args.only_router_muon:
     router_params = _collect_router_params()
@@ -1288,9 +1340,20 @@ elif args.use_adamw_router:
     optimizer3 = Muon(muon_params, lr=args.lr_muon, momentum=args.momentum, backend=args.muon_svd_backend)
 else:
     optimizer3 = Muon(all_h_params, lr=args.lr_muon, momentum=args.momentum, backend=args.muon_svd_backend)
+if router_temperature_params:
+    router_temperature_optimizer = torch.optim.AdamW(
+        router_temperature_params,
+        lr=args.lr_muon,
+        betas=(0.9, 0.95),
+        weight_decay=args.weight_decay,
+        fused=True,
+    )
+
 optimizers = [optimizer1, optimizer2, optimizer3]
 if router_optimizer is not None:
     optimizers.append(router_optimizer)
+if router_temperature_optimizer is not None:
+    optimizers.append(router_temperature_optimizer)
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -1715,9 +1778,8 @@ for step in range(start_step, args.num_iterations + 1):
                 # Add expert assignment change percentages for all k values
                 for k in topk_change_percentages:
                     wandb_log_extra[f'track_tokens/layer_{li}/top{k}_change'] = float(topk_change_percentages[k][li])
-                    
-                wandb_log_extra[f'track_tokens/layer_{li}/chosen_changed'] = float(any_topk_changed_percentages[li])
                 
+                wandb_log_extra[f'track_tokens/layer_{li}/chosen_changed'] = float(any_topk_changed_percentages[li])
             wandb.log(wandb_log_extra, step=step)
         # now also log the earlier val metrics
         if master_process:
@@ -1944,6 +2006,7 @@ for step in range(start_step, args.num_iterations + 1):
                     wandb_log[f'train_loss_free_bias/Layer {li}/expert_{ei}'] = float(bias_vals[ei].item())
         for key in ROUTER_VALUE_KEYS:
             wandb_log[f'router_values/total_{key}'] = float(total_router_values_avg[key].item())
+        _append_router_temperature_logs(wandb_log)
         wandb.log(wandb_log, step=step+1)
 
 if master_process:

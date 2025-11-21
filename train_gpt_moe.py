@@ -1438,6 +1438,15 @@ for step in range(start_step, args.num_iterations + 1):
     if len(grads_norms) > 0:
         grad_norm = torch.norm(torch.stack(grads_norms), 2)
 
+    # step the optimizers and schedulers
+    for opt, sched in zip(optimizers, schedulers):
+        opt.step()
+        sched.step()
+
+    # null the gradients
+    model.zero_grad(set_to_none=True)
+    raw_model.finalize_loss_free_updates()
+    
     # average and all-reduce router stats across accumulation steps and processes
     router_entropy_avg = router_entropy_sum / train_accumulation_steps
     expert_balance_avg = expert_balance_sum / train_accumulation_steps
@@ -1456,15 +1465,6 @@ for step in range(start_step, args.num_iterations + 1):
     for key in ROUTER_VALUE_KEYS:
         dist.all_reduce(layer_router_values_avg[key], op=dist.ReduceOp.AVG)
         dist.all_reduce(total_router_values_avg[key], op=dist.ReduceOp.AVG)
-
-    # step the optimizers and schedulers
-    for opt, sched in zip(optimizers, schedulers):
-        opt.step()
-        sched.step()
-
-    # null the gradients
-    model.zero_grad(set_to_none=True)
-    raw_model.finalize_loss_free_updates()
     # --------------- TRAINING SECTION END -------------------
 
     if master_process:
@@ -1473,12 +1473,6 @@ for step in range(start_step, args.num_iterations + 1):
         with open(logfile, "a") as f:
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
         # wandb logging
-        # capture the current learning rates after scheduler updates
-        current_embed_lr = optimizers[0].param_groups[0]['lr']
-        current_head_lr = optimizers[1].param_groups[0]['lr']
-        current_blocks_lr = optimizers[2].param_groups[0]['lr']
-        current_router_lr = router_optimizer.param_groups[0]['lr'] if router_optimizer is not None else None
-        
         wandb_train_log(
             step + 1,
             train_loss,
@@ -1486,10 +1480,8 @@ for step in range(start_step, args.num_iterations + 1):
             grad_norm,
             approx_time,
             timed_steps,
-            current_embed_lr,
-            current_head_lr,
-            current_blocks_lr,
-            current_router_lr,
+            optimizers,
+            router_optimizer,
             layer_expert_balance_avg,
             layer_router_entropy_avg,
             expert_balance_avg,

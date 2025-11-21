@@ -90,10 +90,8 @@ def wandb_train_log(
     grad_norm,
     approx_time,
     timed_steps,
-    current_embed_lr,
-    current_head_lr,
-    current_blocks_lr,
-    current_router_lr,
+    optimizers,
+    router_optimizer,
     layer_expert_balance_avg,
     layer_router_entropy_avg,
     expert_balance_avg,
@@ -109,12 +107,12 @@ def wandb_train_log(
         'train/grad_norm': float(grad_norm.item()),
         'train/step_time_ms': float(approx_time),
         'train/step_avg_ms': float(approx_time / timed_steps),
-        'lr/embed': float(current_embed_lr),
-        'lr/head': float(current_head_lr),
-        'lr/blocks': float(current_blocks_lr),
+        'lr/embed': float(optimizers[0].param_groups[0]['lr']),
+        'lr/head': float(optimizers[1].param_groups[0]['lr']),
+        'lr/blocks': float(optimizers[2].param_groups[0]['lr']),
     }
-    if current_router_lr is not None:
-        log['lr/router'] = float(current_router_lr)
+    if router_optimizer is not None:
+        log['lr/router'] = float(router_optimizer.param_groups[0]['lr'])
     log.update(log_max_vio(layer_expert_balance_avg, 'train/MaxViobatch', 'train/MaxViobatch'))
     log.update(log_entropy(layer_router_entropy_avg))
     log.update(log_expert_balance(expert_balance_avg, layer_expert_balance_avg, num_experts, 'train'))

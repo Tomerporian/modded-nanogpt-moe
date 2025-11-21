@@ -26,6 +26,7 @@ import torch._inductor.config as config
 import torch._dynamo as dynamo
 from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
+from wandb_logging import init_wandb, wandb_train_log, wandb_val_log
 from params import parse_args
 from optimizers import Muon
 from logger import setup_default_logging
@@ -144,17 +145,6 @@ def diff_routing(logits, k):
     gate, topk_idx = torch.topk(topk_weights, k, dim=-1)
     return topk_idx, probs, gate
 
-
-def maxvio_per_layer(balance_tensor: torch.Tensor) -> torch.Tensor:
-    """
-    Compute per-layer MaxVio (maximal violation) as defined in Eq. (4) of
-    Wang et al. (2024), i.e., (max_i Load_i - Load_bar) / Load_bar.
-    """
-    if balance_tensor.ndim == 1:
-        balance_tensor = balance_tensor.unsqueeze(0)
-    expected_frac = balance_tensor.new_tensor(1.0 / balance_tensor.size(-1))
-    per_layer_max = balance_tensor.max(dim=-1).values
-    return (per_layer_max - expected_frac) / expected_frac
 
 
 ROUTER_VALUE_KEYS = (
@@ -964,8 +954,10 @@ enable_math_sdp(False)
 
 # init the optimizer(s)
 all_h_params = list(raw_model.transformer.h.parameters())
-optimizer1 = torch.optim.AdamW([raw_model.transformer.wte.weight], lr=args.lr_embed, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
-optimizer2 = torch.optim.AdamW([raw_model.lm_head.weight], lr=args.lr_head, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
+adamw_betas = tuple(args.adamw_betas)
+adamw_fused = args.adamw_fused
+optimizer1 = torch.optim.AdamW([raw_model.transformer.wte.weight], lr=args.lr_embed, betas=adamw_betas, weight_decay=args.weight_decay, fused=adamw_fused)
+optimizer2 = torch.optim.AdamW([raw_model.lm_head.weight], lr=args.lr_head, betas=adamw_betas, weight_decay=args.weight_decay, fused=adamw_fused)
 router_optimizer = None
 router_temperature_optimizer = None
 
@@ -992,41 +984,31 @@ def _collect_router_params():
             router_params_local.extend(list(router_module.parameters()))
     return router_params_local
 
-def _append_router_temperature_logs(log_dict):
-    if not raw_model.config.use_router_temperature:
-        return
-    for li, block in enumerate(raw_model.transformer.h):
-        temp_param = getattr(block.mlp, 'router_temperature_log', None)
-        if temp_param is None:
-            continue
-        temp_value = torch.exp(temp_param.detach().float().cpu()).item()
-        log_dict[f'router_temperature/Layer {li}'] = float(temp_value)
-
 if args.only_router_muon:
     router_params = _collect_router_params()
-    router_optimizer = Muon(router_params, lr=args.lr_muon, momentum=args.momentum, backend=args.muon_svd_backend)
+    router_optimizer = Muon(router_params, lr=args.lr_muon, momentum=args.momentum, backend=args.muon_svd_backend, nesterov=args.muon_nesterov, backend_steps=args.muon_backend_steps)
     router_param_ids = {id(p) for p in router_params}
     blocks_params = [p for p in all_h_params if id(p) not in router_param_ids]
 
-    optimizer3 = torch.optim.AdamW(blocks_params, lr=6e-4, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
+    optimizer3 = torch.optim.AdamW(blocks_params, lr=6e-4, betas=adamw_betas, weight_decay=args.weight_decay, fused=adamw_fused)
 elif args.use_adamw_opt3:
-    optimizer3 = torch.optim.AdamW(all_h_params, lr=6e-4, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
+    optimizer3 = torch.optim.AdamW(all_h_params, lr=6e-4, betas=adamw_betas, weight_decay=args.weight_decay, fused=adamw_fused)
 elif args.use_adamw_router:
     router_params = _collect_router_params()
-    router_optimizer = torch.optim.AdamW(router_params, lr=args.lr_muon, betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
+    router_optimizer = torch.optim.AdamW(router_params, lr=args.lr_muon, betas=adamw_betas, weight_decay=args.weight_decay, fused=adamw_fused)
     router_param_ids = {id(p) for p in router_params}
     muon_params = [p for p in all_h_params if id(p) not in router_param_ids]
     
-    optimizer3 = Muon(muon_params, lr=args.lr_muon, momentum=args.momentum, backend=args.muon_svd_backend)
+    optimizer3 = Muon(muon_params, lr=args.lr_muon, momentum=args.momentum, backend=args.muon_svd_backend, nesterov=args.muon_nesterov, backend_steps=args.muon_backend_steps)
 else:
-    optimizer3 = Muon(all_h_params, lr=args.lr_muon, momentum=args.momentum, backend=args.muon_svd_backend)
+    optimizer3 = Muon(all_h_params, lr=args.lr_muon, momentum=args.momentum, backend=args.muon_svd_backend, nesterov=args.muon_nesterov, backend_steps=args.muon_backend_steps)
 if router_temperature_params:
     router_temperature_optimizer = torch.optim.AdamW(
         router_temperature_params,
         lr=args.lr_muon,
-        betas=(0.9, 0.95),
+        betas=adamw_betas,
         weight_decay=args.weight_decay,
-        fused=True,
+        fused=adamw_fused,
     )
 
 optimizers = [optimizer1, optimizer2, optimizer3]
@@ -1100,84 +1082,15 @@ if master_process:
     # save args to file
     with open(os.path.join(args.output, 'args.yaml'), 'w') as f:
         f.write(args_text)
-    # init wandb
-    
-    # Create config from args and add computed/runtime information
-    config = vars(args).copy()  # Convert args to dict
-    blocks_group = optimizer3.param_groups[0]
-    is_blocks_muon = isinstance(optimizer3, Muon)
-    config.update({
-        'train_accumulation_steps': train_accumulation_steps,
-        'val_steps': val_steps,
-        'num_experts': num_experts,
-        'ddp_world_size': ddp_world_size,
-        'ddp_rank': ddp_rank,
-        'ddp_local_rank': ddp_local_rank,
-        'model_n_layer': raw_model.config.n_layer,
-        'model_n_head': raw_model.config.n_head,
-        'model_n_embd': raw_model.config.n_embd,
-        'model_router_type': raw_model.transformer.h[0].mlp.router_type,
-        'model_router_top_k': raw_model.transformer.h[0].mlp.top_k,
-        'model_router_depth': raw_model.transformer.h[0].mlp.router_depth,
-        'model_router_activation': raw_model.transformer.h[0].mlp.router_activation,
-        'global_load_balance': args.global_load_balance,
-        'model_global_load_balance': raw_model.config.global_load_balance,
-        'optimizer_embed_lr': optimizer1.param_groups[0]['lr'],
-        'optimizer_embed_betas': tuple(optimizer1.param_groups[0]['betas']),
-        'optimizer_embed_fused': bool(optimizer1.param_groups[0].get('fused', False)),
-        'optimizer_head_lr': optimizer2.param_groups[0]['lr'],
-        'optimizer_head_betas': tuple(optimizer2.param_groups[0]['betas']),
-        'optimizer_head_fused': bool(optimizer2.param_groups[0].get('fused', False)),
-        'optimizer_blocks_type': optimizer3.__class__.__name__,
-        'optimizer_blocks_lr': blocks_group['lr'],
-        'optimizer_blocks_betas': tuple(blocks_group['betas']) if 'betas' in blocks_group else None,
-        'optimizer_blocks_fused': bool(blocks_group.get('fused', False)),
-        'optimizer_muon_lr': blocks_group['lr'] if is_blocks_muon else None,
-        'optimizer_muon_momentum': optimizer3.defaults.get('momentum', None) if is_blocks_muon else None,
-        'optimizer_muon_nesterov': optimizer3.defaults.get('nesterov', None) if is_blocks_muon else None,
-        'optimizer_muon_backend': optimizer3.defaults.get('backend', None) if is_blocks_muon else None,
-        'optimizer_muon_backend_steps': optimizer3.defaults.get('backend_steps', None) if is_blocks_muon else None,
-        'amp_dtype': 'bfloat16',
-        'torch_compile': True,
-        'attention_backend': 'cudnn_sdp',
-    })
-    if router_optimizer is not None:
-        router_group = router_optimizer.param_groups[0]
-        router_is_muon = isinstance(router_optimizer, Muon)
-        router_config = {
-            'optimizer_router_type': router_optimizer.__class__.__name__,
-            'optimizer_router_lr': router_group['lr'],
-            'optimizer_router_betas': tuple(router_group['betas']) if 'betas' in router_group else None,
-            'optimizer_router_fused': bool(router_group.get('fused', False)),
-        }
-        if router_is_muon:
-            router_config.update({
-                'optimizer_router_muon_momentum': router_optimizer.defaults.get('momentum', None),
-                'optimizer_router_muon_nesterov': router_optimizer.defaults.get('nesterov', None),
-                'optimizer_router_muon_backend': router_optimizer.defaults.get('backend', None),
-                'optimizer_router_muon_backend_steps': router_optimizer.defaults.get('backend_steps', None),
-            })
-        else:
-            router_config.update({
-                'optimizer_router_muon_momentum': None,
-                'optimizer_router_muon_nesterov': None,
-                'optimizer_router_muon_backend': None,
-                'optimizer_router_muon_backend_steps': None,
-            })
-        config.update(router_config)
-    
-    run_name = os.path.basename(args.output)
-    # group seeds
-    # group_args = "+".join([x for x in run_name.split("+")[1:] if 'see=' not in x])
-    # group_base = run_name.split("+")[0][13:]
-    # group = group_base + group_args
-    
-    # tags = [x for x in os.path.basename(args.output).split("+")[1:] if len(x) > 0]
-    
-    wandb_run = wandb.init(project=args.wandb_project, 
-                           name=run_name, 
-                        #    tags=tags,
-                           config=config)
+    init_wandb(
+        args,
+        optimizer3,
+        train_accumulation_steps,
+        val_steps,
+        ddp_world_size,
+        ddp_rank,
+        ddp_local_rank,
+    )
 
 # Sample fixed sequences for expert assignment tracking
 if master_process and args.n_tracked_seq > 0:
@@ -1384,47 +1297,27 @@ for step in range(start_step, args.num_iterations + 1):
         
         # log to wandb
         if master_process:
-            wandb_log_extra = {}
-            for li in range(raw_model.config.n_layer):
-                wandb_log_extra[f'Router Grad Norms (CE)/Layer {li}'] = float(ce_router_layer_grad_norms[li].item())
-                wandb_log_extra[f'Router Grad Norms (AUX)/Layer {li}'] = float(aux_router_layer_grad_norms[li].item())
-                # Add expert assignment change percentages for all k values
-                for k in topk_change_percentages:
-                    wandb_log_extra[f'track_tokens/layer_{li}/top{k}_change'] = float(topk_change_percentages[k][li])
-                
-                wandb_log_extra[f'track_tokens/layer_{li}/chosen_changed'] = float(any_topk_changed_percentages[li])
-            wandb.log(wandb_log_extra, step=step)
-        # now also log the earlier val metrics
-        if master_process:
-            wandb_log = {
-                'val/loss': float(val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss),
-                'val/ce_loss': float(val_ce_loss.item() if isinstance(val_ce_loss, torch.Tensor) else val_ce_loss),
-                'val/aux_loss': float(val_aux_loss.item() if isinstance(val_aux_loss, torch.Tensor) else val_aux_loss),
-                'val/router_entropy': float(val_router_entropy.item()),
-            }
-            val_maxvio_layers = maxvio_per_layer(val_layer_expert_balance.detach())
-            val_maxvio_layers_cpu = val_maxvio_layers.cpu()
-            wandb_log['val/MaxVioglobal'] = float(val_maxvio_layers_cpu.mean().item())
-            for i in range(num_experts):
-                wandb_log[f'val/expert_balance/{i}'] = float(val_expert_balance[i].item())
-            for li in range(n_layers):
-                wandb_log[f'Router Entropy/Layer {li}'] = float(val_layer_router_entropy[li].item())
-                wandb_log[f'val/MaxVioglobal/Layer {li}'] = float(val_maxvio_layers_cpu[li].item())
-                for ei in range(num_experts):
-                    wandb_log[f'Expert Balance/Layer {li}/{ei}'] = float(val_layer_expert_balance[li, ei].item())
-                for key in ROUTER_VALUE_KEYS:
-                    wandb_log[f'router_values/layer_{li}_{key}'] = float(val_layer_router_values[key][li].item())
-                mlp = raw_model.transformer.h[li].mlp
-                bias_vec = mlp._loss_free_bias_vector()
-                if bias_vec is not None:
-                    bias_vals = bias_vec.detach().float().cpu()
-                    for ei in range(mlp.num_experts):
-                        wandb_log[f'val_loss_free_bias/Layer {li}/expert_{ei}'] = float(bias_vals[ei].item())
-            for key in ROUTER_VALUE_KEYS:
-                wandb_log[f'router_values/total_{key}'] = float(val_total_router_values[key].item())
-            wandb_log['train/time_ms'] = float(training_time_ms)
-            wandb_log['train/step_avg_ms'] = float(training_time_ms/(timed_steps-1))
-            wandb.log(wandb_log, step=step)
+            wandb_val_log(
+                step,
+                val_loss,
+                val_ce_loss,
+                val_aux_loss,
+                val_router_entropy,
+                training_time_ms,
+                timed_steps,
+                val_layer_expert_balance,
+                val_layer_router_entropy,
+                val_expert_balance,
+                num_experts,
+                val_layer_router_values,
+                val_total_router_values,
+                raw_model,
+                ce_router_layer_grad_norms,
+                aux_router_layer_grad_norms,
+                topk_change_percentages,
+                any_topk_changed_percentages,
+                ROUTER_VALUE_KEYS,
+            )
 
         # start the clock again
         torch.cuda.synchronize()
@@ -1568,59 +1461,44 @@ for step in range(start_step, args.num_iterations + 1):
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
         sched.step()
-    # capture the current learning rates after scheduler updates
-    current_embed_lr = optimizers[0].param_groups[0]['lr']
-    current_head_lr = optimizers[1].param_groups[0]['lr']
-    current_blocks_lr = optimizers[2].param_groups[0]['lr']
-    current_router_lr = router_optimizer.param_groups[0]['lr'] if router_optimizer is not None else None
+
     # null the gradients
     model.zero_grad(set_to_none=True)
     raw_model.finalize_loss_free_updates()
     # --------------- TRAINING SECTION END -------------------
-    # everything that follows now is just diagnostics, prints, logging, etc.
 
-    #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process:
         approx_time = training_time_ms + 1000 * (time.time() - t0)
         logging.info(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         with open(logfile, "a") as f:
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
         # wandb logging
-        wandb_log = {
-            'train/loss': float(train_loss.item()),
-            'train/router_entropy': float(router_entropy_avg.item()),
-            'train/grad_norm': float(grad_norm.item()),
-            'train/step_time_ms': float(approx_time),
-            'train/step_avg_ms': float(approx_time/timed_steps),
-            'lr/embed': float(current_embed_lr),
-            'lr/head': float(current_head_lr),
-            'lr/blocks': float(current_blocks_lr),
-        }
-        if current_router_lr is not None:
-            wandb_log['lr/router'] = float(current_router_lr)
-        train_maxvio_layers = maxvio_per_layer(layer_expert_balance_avg.detach())
-        train_maxvio_layers_cpu = train_maxvio_layers.cpu()
-        wandb_log['train/MaxViobatch'] = float(train_maxvio_layers_cpu.mean().item())
-        for i_exp in range(num_experts):
-            wandb_log[f'train/expert_balance/{i_exp}'] = float(expert_balance_avg[i_exp].item())
-        # per-layer router stats (no per-step grad norms anymore)
-        for li in range(n_layers):
-            wandb_log[f'Router Entropy/Layer {li}'] = float(layer_router_entropy_avg[li].item())
-            wandb_log[f'train/MaxViobatch/Layer {li}'] = float(train_maxvio_layers_cpu[li].item())
-            for ei in range(num_experts):
-                wandb_log[f'Expert Balance/Layer {li}/{ei}'] = float(layer_expert_balance_avg[li, ei].item())
-            for key in ROUTER_VALUE_KEYS:
-                wandb_log[f'router_values/layer_{li}_{key}'] = float(layer_router_values_avg[key][li].item())
-            mlp = raw_model.transformer.h[li].mlp
-            bias_vec = mlp._loss_free_bias_vector()
-            if bias_vec is not None:
-                bias_vals = bias_vec.detach().float().cpu()
-                for ei in range(mlp.num_experts):
-                    wandb_log[f'train_loss_free_bias/Layer {li}/expert_{ei}'] = float(bias_vals[ei].item())
-        for key in ROUTER_VALUE_KEYS:
-            wandb_log[f'router_values/total_{key}'] = float(total_router_values_avg[key].item())
-        _append_router_temperature_logs(wandb_log)
-        wandb.log(wandb_log, step=step+1)
+        # capture the current learning rates after scheduler updates
+        current_embed_lr = optimizers[0].param_groups[0]['lr']
+        current_head_lr = optimizers[1].param_groups[0]['lr']
+        current_blocks_lr = optimizers[2].param_groups[0]['lr']
+        current_router_lr = router_optimizer.param_groups[0]['lr'] if router_optimizer is not None else None
+        
+        wandb_train_log(
+            step + 1,
+            train_loss,
+            router_entropy_avg,
+            grad_norm,
+            approx_time,
+            timed_steps,
+            current_embed_lr,
+            current_head_lr,
+            current_blocks_lr,
+            current_router_lr,
+            layer_expert_balance_avg,
+            layer_router_entropy_avg,
+            expert_balance_avg,
+            layer_router_values_avg,
+            total_router_values_avg,
+            raw_model,
+            num_experts,
+            ROUTER_VALUE_KEYS,
+        )
 
 if master_process:
     logging.info(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")

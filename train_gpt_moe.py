@@ -120,7 +120,10 @@ def switch_topk(logits, k, null_expert_bias=0.0, weight_logits=None, probs_overr
     else:
         topk_logits = torch.gather(weight_logits, dim=-1, index=topk_idx)
         gate = F.softmax(topk_logits, dim=-1)
-    return topk_idx, probs, gate
+    # Routed probabilities reflect the actual mixture used in the forward pass
+    routed_probs = torch.zeros_like(probs)
+    routed_probs.scatter_(dim=-1, index=topk_idx, src=gate)
+    return topk_idx, routed_probs, gate
 
 
 def hash_select(token_ids, num_experts, null_expert_bias=0.0):
@@ -133,7 +136,6 @@ def hash_select(token_ids, num_experts, null_expert_bias=0.0):
     return selected_expert, routing_weights, selected_prob
 
 def diff_routing(logits, k):
-    probs = logits.softmax(dim=-1)
     z_max = torch.max(logits, dim=-1, keepdim=True).values
     exp_z = torch.exp(logits - z_max)
     num_experts = exp_z.shape[-1]
@@ -143,8 +145,17 @@ def diff_routing(logits, k):
     topk_weights = topk_exp_z / (topk_exp_z.sum(dim=-1, keepdim=True) + 1e-8)
     # Get indices of top-k for compatibility
     gate, topk_idx = torch.topk(topk_weights, k, dim=-1)
-    return topk_idx, probs, gate
+    return topk_idx, topk_weights, gate
 
+
+def diff_no_softmax(logits, k):
+    num_experts = logits.shape[-1]
+    kth_smallest_idx = num_experts - k
+    m = torch.kthvalue(logits, k=kth_smallest_idx, dim=-1, keepdim=True).values
+    topk = F.relu(logits - m)
+    topk_weights = topk / (topk.sum(dim=-1, keepdim=True) + 1e-8)
+    gate, topk_idx = torch.topk(topk_weights, k, dim=-1)
+    return topk_idx, topk_weights, gate
 
 
 ROUTER_VALUE_KEYS = (
@@ -187,12 +198,13 @@ class MoE(nn.Module):
         self.loss_free_bias_rule = config.loss_free_bias_rule
         self.router_logit_jitter = config.router_logit_jitter
         self.use_router_temperature = config.use_router_temperature
+        self.aux_use_routed_prob = config.aux_use_routed_prob
         if self.use_router_temperature:
             self.router_temperature_log = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         else:
             self.register_parameter('router_temperature_log', None)
 
-        assert self.router_type in ('hash', 'switch', 'diff')
+        assert self.router_type in ('hash', 'switch', 'diff', 'diff_no_softmax')
         assert self.router_activation in ('gelu', 'relu', 'relu_squared')
         assert self.loss_free_mode in ('none', 'deepseek', 'stopgrad')
         assert self.loss_free_bias_rule in ('ema', 'sign')
@@ -327,7 +339,8 @@ class MoE(nn.Module):
         logits_for_selection = None
         logits_for_weights = None
         logits_for_stats = None
-        if self.router_type in ("switch", "diff"):
+        routed_probs_for_aux = None
+        if self.router_type in ("switch", "diff", "diff_no_softmax"):
             logits = self.router(x)
             if self.training and self.router_logit_jitter > 0.0:
                 noise = torch.empty_like(logits).uniform_(
@@ -354,7 +367,7 @@ class MoE(nn.Module):
             logits_for_stats = logits_for_weights
         if self.router_type == "switch":
             router_probs = logits_for_stats.softmax(dim=-1)
-            topk_idx, _, gate = switch_topk(
+            topk_idx, routed_probs_for_aux, gate = switch_topk(
                 logits_for_selection,
                 self.top_k,
                 weight_logits=logits_for_weights,
@@ -362,7 +375,10 @@ class MoE(nn.Module):
             )
             probs = router_probs
         elif self.router_type == "diff":
-            topk_idx, _, gate = diff_routing(logits_for_selection, self.top_k)
+            topk_idx, routed_probs_for_aux, gate = diff_routing(logits_for_selection, self.top_k)
+            probs = logits_for_weights.softmax(dim=-1)
+        elif self.router_type == "diff_no_softmax":
+            topk_idx, routed_probs_for_aux, gate = diff_no_softmax(logits_for_selection, self.top_k)
             probs = logits_for_weights.softmax(dim=-1)
         elif self.router_type == "hash":
             topk_idx, probs, gate = hash_select(token_idx, self.num_experts)
@@ -452,7 +468,10 @@ class MoE(nn.Module):
                 router_entropy = token_H.mean() / math.log(float(self.num_experts))
             # Switch paper:  L_aux = E * <load,prob>
             if self.router_type != "hash":
-                probs_full = logits_for_stats.softmax(dim=-1).reshape(-1, self.num_experts)
+                if self.aux_use_routed_prob and routed_probs_for_aux is not None:
+                    probs_full = routed_probs_for_aux.reshape(-1, self.num_experts)
+                else:
+                    probs_full = logits_for_stats.softmax(dim=-1).reshape(-1, self.num_experts)
                 frac_for_aux = global_frac_override if global_frac_override is not None else frac
                 probs_mean = probs_full.mean(0)
                 aux = self.num_experts * (frac_for_aux * probs_mean).sum()
@@ -506,6 +525,7 @@ class GPTConfig:
     router_depth : int = 1
     router_activation : str = 'gelu'
     global_load_balance : bool = False
+    aux_use_routed_prob : bool = False
     loss_free_mode : str = 'none'
     loss_free_decay : float = 0.99
     loss_free_strength : float = 1.0
@@ -923,6 +943,7 @@ model = GPT(GPTConfig(
     router_depth=args.router_depth,
     router_activation=args.router_activation,
     global_load_balance=args.global_load_balance,
+    aux_use_routed_prob=args.aux_use_routed_prob,
     loss_free_mode=args.loss_free_mode,
     loss_free_decay=args.loss_free_decay,
     loss_free_strength=args.loss_free_strength,

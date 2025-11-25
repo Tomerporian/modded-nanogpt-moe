@@ -2,6 +2,17 @@ import argparse
 import yaml
 
 
+def _str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.strip().lower()
+    if value in ('True', 'true', '1', 'yes', 'y', 'on'):
+        return True
+    if value in ('False', 'false', '0', 'no', 'n', 'off'):
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got '{value}'")
+
+
 def _build_training_parser():
     parser = argparse.ArgumentParser(description='NanoGPT MoE Training')
 
@@ -26,7 +37,7 @@ def _build_training_parser():
                        help='number of MoE experts')
     group.add_argument('--top-k', default=2, type=int,
                        help='top-k experts to use')
-    group.add_argument('--router-type', default='diff', type=str, choices=['switch', 'diff', 'hash'],
+    group.add_argument('--router-type', default='diff', type=str, choices=['switch', 'diff', 'diff_no_softmax', 'hash'],
                        help='router type for MoE')
     group.add_argument('--router-depth', default=1, type=int,
                        help='number of layers in the router MLP for non-hash routing (hidden dim == input dim)')
@@ -34,6 +45,8 @@ def _build_training_parser():
                        help='activation to use between router MLP layers (if depth > 1)')
     group.add_argument('--global-load-balance', action='store_true', default=False,
                        help='enable global batch load balancing for auxiliary router loss')
+    group.add_argument('--aux-use-routed-prob', action='store_true', default=False,
+                       help='compute aux load balancing loss with the probabilities actually used to route tokens')
     group.add_argument('--loss-free-mode', default='none', type=str, choices=['none', 'deepseek', 'stopgrad'],
                        help='loss-free router biasing strategy (deepseek for switch only, stopgrad supports switch/diff)')
     group.add_argument('--loss-free-decay', default=0.99, type=float,
@@ -65,6 +78,10 @@ def _build_training_parser():
                        help='iterations of linear warmup/warmdown for triangular or trapezoidal schedule')
     group.add_argument('--weight-decay', default=0.0, type=float,
                        help='weight decay')
+    group.add_argument('--adamw-betas', nargs=2, type=float, default=(0.9, 0.95), metavar=('BETA1', 'BETA2'),
+                       help='beta1 and beta2 for AdamW optimizers')
+    group.add_argument('--adamw-fused', type=_str2bool, default=True, metavar='BOOL',
+                       help='enable fused AdamW kernels (set to false to disable fused kernels)')
     group.add_argument('--use_adamw_opt3', action='store_true', default=False,
                        help='use AdamW instead of Muon for transformer blocks')
     group.add_argument('--use_adamw_router', action='store_true', default=False,
@@ -73,6 +90,10 @@ def _build_training_parser():
                        help='use Muon only for router parameters and AdamW for the rest of the transformer blocks')
     group.add_argument('--muon-svd-backend', default='newtonschulz5', type=str, choices=['newtonschulz5', 'svd'],
                        help='method used for Muon orthogonalization backend')
+    group.add_argument('--muon-nesterov', type=_str2bool, default=True, metavar='BOOL',
+                       help='use Nesterov momentum in the Muon optimizer')
+    group.add_argument('--muon-backend-steps', type=int, default=5,
+                       help='iteration steps for the Muon backend orthogonalization')
 
     # Learning rate parameters
     group = parser.add_argument_group('Learning rate parameters')

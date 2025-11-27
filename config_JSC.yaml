@@ -46,13 +46,13 @@ parameters:
 
   global_load_balance: [true]
 
+  router_type: ['switch', 'diff', 'diff_no_softmax']
+  aux_use_routed_prob: [false, true]
+
   LIST_LB_COEFFS:
     - aux_coeff_train: [0.1]
       aux_coeff_val: [0.1]
-      router_type: ['switch', 'diff', 'diff_no_softmax']
-    - aux_coeff_train: [0.5]
-      aux_coeff_val: [0.5]
-      router_type: ['diff']
+    
 
   LIST_EXPERT_SIZES:
     - num_experts: [64]
@@ -61,11 +61,10 @@ parameters:
     - num_experts: [128]
       top_k: [32]
       hidden_dim_scale_factor: [0.25]
-    - num_experts: [64]
-      top_k: [2]
-      hidden_dim_scale_factor: [0.5]
-    - num_experts: [128]
-      top_k: [4]
-      hidden_dim_scale_factor: [0.25]
+    # - num_experts: [64]
+    #   top_k: [2]
+    #   hidden_dim_scale_factor: [0.5]
+    # - num_experts: [128]
+    #   top_k: [4]
+    #   hidden_dim_scale_factor: [0.25]
     # If 48 exps is too many, comment out the last 2 (lines 64-69)
-    

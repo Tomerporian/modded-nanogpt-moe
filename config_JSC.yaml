@@ -1,5 +1,5 @@
 job_details:
-  name: loss_free_fixed_step
+  name: smaller_experts
   output_dir: logs/seeds_and_datasets
 
 parameters:
@@ -16,13 +16,11 @@ parameters:
   n_layer: [12]
   n_head: [6] # change to 12?
   n_embd: [768]
-  num_experts: [8]
-  top_k: [2]
   # router_type: ['switch', 'diff']
 
   # Optimization parameters
   batch_size: [512]  # 8*64
-  device_batch_size: [16]
+  device_batch_size: [8]  # was 16
   sequence_length: [1024]
   num_iterations: [6000] # was 4578 before
   warmup_iters: [0]
@@ -42,22 +40,32 @@ parameters:
   wandb_project: ["modded-nanogpt-moe"]
   output: ["logs"]
 
-  # Loss parameters
-  # LIST_LB_COEFFS:
-  #   - aux_coeff_train: [0.1]
-  #     aux_coeff_val: [0.1]
-  #   - aux_coeff_train: [0.01]
-  #     aux_coeff_val: [0.01]
-
   # Run config
   device_0: [true]
-  seed: [1000]
+  seed: [1000, 2000, 3000]
 
-  router_type: ['switch', 'diff']
-  router_logit_jitter: [0.01, 0.1, 0.5]
+  global_load_balance: [true]
 
-  LIST_TESTS:
+  LIST_LB_COEFFS:
     - aux_coeff_train: [0.1]
       aux_coeff_val: [0.1]
-    - aux_coeff_train: [0.01]
-      aux_coeff_val: [0.01]
+      router_type: ['switch', 'diff', 'diff_no_softmax']
+    - aux_coeff_train: [0.5]
+      aux_coeff_val: [0.5]
+      router_type: ['diff']
+
+  LIST_EXPERT_SIZES:
+    - num_experts: [64]
+      top_k: [16]
+      hidden_dim_scale_factor: [0.5]
+    - num_experts: [128]
+      top_k: [32]
+      hidden_dim_scale_factor: [0.25]
+    - num_experts: [64]
+      top_k: [2]
+      hidden_dim_scale_factor: [0.5]
+    - num_experts: [128]
+      top_k: [4]
+      hidden_dim_scale_factor: [0.25]
+    # If 48 exps is too many, comment out the last 2 (lines 64-69)
+    

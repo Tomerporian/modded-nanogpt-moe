@@ -100,8 +100,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        hidden_dim = int(round(config.n_embd * config.hidden_dim_scale_factor))
+        self.c_fc    = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_proj  = nn.Linear(hidden_dim, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
@@ -519,6 +520,7 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
+    hidden_dim_scale_factor : float = 4.0
     num_experts : int = 8
     top_k : int = 2
     router_type : str = 'diff'
@@ -937,6 +939,7 @@ model = GPT(GPTConfig(
     n_layer=args.n_layer, 
     n_head=args.n_head, 
     n_embd=args.n_embd,
+    hidden_dim_scale_factor=args.hidden_dim_scale_factor,
     num_experts=args.num_experts,
     top_k=args.top_k,
     router_type=args.router_type,

@@ -33,6 +33,8 @@ def _build_training_parser():
                        help='number of attention heads')
     group.add_argument('--n-embd', default=768, type=int,
                        help='embedding dimension')
+    group.add_argument('--hidden-dim-scale-factor', default=4.0, type=float,
+                       help='scale factor applied to n_embd to compute the MLP hidden dimension')
     group.add_argument('--num-experts', default=8, type=int,
                        help='number of MoE experts')
     group.add_argument('--top-k', default=2, type=int,

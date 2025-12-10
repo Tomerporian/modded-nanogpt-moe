@@ -86,6 +86,7 @@ def build_track_tokens_log(n_layers, topk_change_percentages, any_topk_changed_p
 def wandb_train_log(
     log_step,
     train_loss,
+    train_diff_topk_reg,
     router_entropy_avg,
     grad_norm,
     approx_time,
@@ -100,9 +101,11 @@ def wandb_train_log(
     raw_model,
     num_experts,
     router_value_keys,
+    diff_topk_reg_coeff,
 ):
     log = {
         'train/loss': float(train_loss.item()),
+        'train/diff_topk_reg': float(train_diff_topk_reg.item()),
         'train/router_entropy': float(router_entropy_avg.item()),
         'train/grad_norm': float(grad_norm.item()),
         'train/step_time_ms': float(approx_time),
@@ -110,6 +113,7 @@ def wandb_train_log(
         'lr/embed': float(optimizers[0].param_groups[0]['lr']),
         'lr/head': float(optimizers[1].param_groups[0]['lr']),
         'lr/blocks': float(optimizers[2].param_groups[0]['lr']),
+        'diff_topk_reg/coeff': float(diff_topk_reg_coeff),
     }
     if router_optimizer is not None:
         log['lr/router'] = float(router_optimizer.param_groups[0]['lr'])
@@ -127,6 +131,7 @@ def wandb_val_log(
     val_loss,
     val_ce_loss,
     val_aux_loss,
+    val_diff_topk_reg,
     val_router_entropy,
     training_time_ms,
     timed_steps,
@@ -162,6 +167,7 @@ def wandb_val_log(
         'val/loss': _to_float(val_loss),
         'val/ce_loss': _to_float(val_ce_loss),
         'val/aux_loss': _to_float(val_aux_loss),
+        'val/diff_topk_reg': _to_float(val_diff_topk_reg),
         'val/router_entropy': float(val_router_entropy.item()),
         'train/time_ms': float(training_time_ms),
         'train/step_avg_ms': float(training_time_ms / max(timed_steps - 1, 1)),

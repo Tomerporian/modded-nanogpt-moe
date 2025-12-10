@@ -129,6 +129,13 @@ def _build_training_parser():
                        help='auxiliary loss coefficient for training')
     group.add_argument('--aux-coeff-val', default=0.0, type=float,
                        help='auxiliary loss coefficient for validation')
+    group.add_argument('--diff-topk-regularizer-max-coeff', default=0.0, type=float,
+                       help='maximum coefficient for the diff-topk normalization regularizer (0 disables it)')
+    group.add_argument('--diff-topk-regularizer-schedule', default='constant', type=str,
+                       choices=['constant', 'cosine'],
+                       help="warm-up schedule for diff-topk regularizer coefficient")
+    group.add_argument('--diff-topk-regularizer-fp32', action='store_true', default=False,
+                       help='compute the diff-topk regularizer in fp32 precision')
 
     # Misc parameters
     group = parser.add_argument_group('Run config')

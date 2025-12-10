@@ -200,6 +200,8 @@ class MoE(nn.Module):
         self.router_logit_jitter = config.router_logit_jitter
         self.use_router_temperature = config.use_router_temperature
         self.aux_use_routed_prob = config.aux_use_routed_prob
+        self.diff_topk_reg_fp32 = config.diff_topk_reg_fp32
+        self.diff_topk_reg_enabled = self.router_type == 'diff' and config.diff_topk_reg_max_coeff > 0.0
         if self.use_router_temperature:
             self.router_temperature_log = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         else:
@@ -309,6 +311,22 @@ class MoE(nn.Module):
         self.loss_free_tokens_accum.zero_()
         self.loss_free_total_accum.zero_()
         self.loss_free_override_frac = None
+
+    def _compute_diff_topk_regularizer(self, logits):
+        if self.diff_topk_reg_fp32:
+            logits.float()
+        
+        num_experts = logits.size(-1)
+        kth_smallest_idx = num_experts - self.top_k
+        z_max = logits.max(dim=-1, keepdim=True).values
+        exp_z = torch.exp(logits - z_max)
+        m_exp_z = torch.kthvalue(exp_z, k=kth_smallest_idx, dim=-1, keepdim=True).values
+        topk_exp_z = torch.relu(exp_z - m_exp_z)
+        trunc_mass = topk_exp_z.sum(dim=-1)
+        total_mass = exp_z.sum(dim=-1)
+        ratio = trunc_mass / (total_mass + 1e-8)
+        reg = -torch.log(torch.clamp(ratio, min=1e-8))
+        return reg.mean()
 
     def finalize_loss_free_update(self):
         if not self.loss_free_enabled:
@@ -436,6 +454,11 @@ class MoE(nn.Module):
                 'coef_diff': (top1_coef_vals - top2_coef_vals).mean(),
             }
 
+        if self.diff_topk_reg_enabled and logits_for_selection is not None:
+            diff_topk_reg = self._compute_diff_topk_regularizer(logits_for_selection)
+        else:
+            diff_topk_reg = torch.tensor(0.0, device=x.device, dtype=torch.float32)
+
         # aux loss and router statistics
         with torch.autocast(device_type="cpu", enabled=False):
             tokens_per_expert = torch.bincount(
@@ -482,9 +505,9 @@ class MoE(nn.Module):
                 raise ValueError(f"unknown routing type: {self.router_type}")
 
         if return_expert_assignments:
-            return y, aux, router_entropy, frac, router_value_stats, topk_idx.view_as(x[:, :, :self.top_k])
+            return y, aux, router_entropy, frac, router_value_stats, diff_topk_reg, topk_idx.view_as(x[:, :, :self.top_k])
         else:
-            return y, aux, router_entropy, frac, router_value_stats
+            return y, aux, router_entropy, frac, router_value_stats, diff_topk_reg
 
 
 class Block(nn.Module):
@@ -499,17 +522,17 @@ class Block(nn.Module):
     def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None):
         x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
         if return_expert_assignments:
-            mlp_out, aux, router_entropy, expert_balance, router_value_stats, expert_assignments = self.mlp(
+            mlp_out, aux, router_entropy, expert_balance, router_value_stats, diff_topk_reg, expert_assignments = self.mlp(
                 F.rms_norm(x, (x.size(-1),)), token_idx, return_expert_assignments=True, router_context=router_context
             )
             x = x + mlp_out
-            return x, aux, router_entropy, expert_balance, router_value_stats, expert_assignments
+            return x, aux, router_entropy, expert_balance, router_value_stats, diff_topk_reg, expert_assignments
         else:
-            mlp_out, aux, router_entropy, expert_balance, router_value_stats = self.mlp(
+            mlp_out, aux, router_entropy, expert_balance, router_value_stats, diff_topk_reg = self.mlp(
                 F.rms_norm(x, (x.size(-1),)), token_idx, router_context=router_context
             )
             x = x + mlp_out
-            return x, aux, router_entropy, expert_balance, router_value_stats
+            return x, aux, router_entropy, expert_balance, router_value_stats, diff_topk_reg
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
@@ -535,6 +558,8 @@ class GPTConfig:
     loss_free_bias_rule : str = 'ema'
     router_logit_jitter : float = 0.0
     use_router_temperature : bool = False
+    diff_topk_reg_max_coeff : float = 0.0
+    diff_topk_reg_fp32 : bool = False
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -551,12 +576,22 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_()
 
-    def forward(self, idx, targets=None, return_logits=True, aux_coeff=0.0, return_expert_assignments=False, router_context=None):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        return_logits=True,
+        aux_coeff=0.0,
+        diff_topk_reg_coeff=0.0,
+        return_expert_assignments=False,
+        router_context=None,
+    ):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         x = F.rms_norm(x, (x.size(-1),))
         total_aux = 0
+        total_diff_topk_reg = torch.tensor(0.0, device=x.device, dtype=torch.float32)
         total_router_entropy = 0
         total_expert_balance = None
         per_layer_router_entropy = []
@@ -565,15 +600,24 @@ class GPT(nn.Module):
         per_layer_router_values = []
         for block in self.transformer.h:
             if return_expert_assignments:
-                x, aux, router_entropy, expert_balance, router_value_stats, expert_assignments = block(
+                (
+                    x,
+                    aux,
+                    router_entropy,
+                    expert_balance,
+                    router_value_stats,
+                    diff_topk_reg,
+                    expert_assignments,
+                ) = block(
                     x, idx, return_expert_assignments=True, router_context=router_context
                 )
                 all_layer_expert_assignments.append(expert_assignments)
             else:
-                x, aux, router_entropy, expert_balance, router_value_stats = block(
+                x, aux, router_entropy, expert_balance, router_value_stats, diff_topk_reg = block(
                     x, idx, router_context=router_context
                 )
             total_aux = total_aux + aux
+            total_diff_topk_reg = total_diff_topk_reg + diff_topk_reg
             total_router_entropy = total_router_entropy + router_entropy
             if total_expert_balance is None:
                 total_expert_balance = expert_balance
@@ -601,7 +645,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x)
             logits = logits.float() # use tf32/fp32 for logits
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            loss = ce_loss + total_aux * aux_coeff
+            loss = ce_loss + total_aux * aux_coeff + total_diff_topk_reg * diff_topk_reg_coeff
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -621,6 +665,7 @@ class GPT(nn.Module):
                 loss,
                 ce_loss,
                 total_aux,
+                total_diff_topk_reg,
                 avg_router_entropy,
                 avg_expert_balance,
                 layer_router_entropy,
@@ -635,6 +680,7 @@ class GPT(nn.Module):
                 loss,
                 ce_loss,
                 total_aux,
+                total_diff_topk_reg,
                 avg_router_entropy,
                 avg_expert_balance,
                 layer_router_entropy,
@@ -954,6 +1000,8 @@ model = GPT(GPTConfig(
     loss_free_bias_rule=args.loss_free_bias_rule,
     router_logit_jitter=args.router_logit_jitter,
     use_router_temperature=args.use_router_temperature,
+    diff_topk_reg_max_coeff=args.diff_topk_regularizer_max_coeff,
+    diff_topk_reg_fp32=args.diff_topk_regularizer_fp32,
 ))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
@@ -1054,6 +1102,20 @@ def get_lr(it):
         decay_ratio = (args.num_iterations - it) / args.warmdown_iters
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+
+def get_diff_topk_reg_coeff(step):
+    max_coeff = args.diff_topk_regularizer_max_coeff
+    if max_coeff <= 0.0:
+        return 0.0
+    schedule = args.diff_topk_regularizer_schedule
+    if schedule == 'cosine':
+        progress = step / args.num_iterations - 1
+        scale = 0.5 * (1.0 - math.cos(math.pi * progress))
+    elif schedule == 'constant':
+        scale = 1.0
+    else:
+        raise ValueError(f"Unsupported diff-topk regularizer schedule: {schedule}")
+    return max_coeff * scale
 
 # handle resume-from-checkpoint
 start_step = 0
@@ -1160,6 +1222,7 @@ for step in range(start_step, args.num_iterations + 1):
         training_time_ms = 0
         t0 = time.time()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+    diff_topk_reg_coeff = get_diff_topk_reg_coeff(step)
 
     # once in a while evaluate the validation dataset
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
@@ -1171,6 +1234,7 @@ for step in range(start_step, args.num_iterations + 1):
         val_loss = 0.0
         val_ce_loss = 0.0
         val_aux_loss = 0.0
+        val_diff_topk_reg = torch.tensor(0.0, device=device)
         val_router_entropy = torch.tensor(0.0, device=device)
         val_expert_balance = torch.zeros(num_experts, device=device)
         # per-layer
@@ -1188,13 +1252,20 @@ for step in range(start_step, args.num_iterations + 1):
                         loss,
                         ce_loss,
                         total_aux,
+                        total_diff_topk_reg,
                         router_entropy,
                         expert_balance,
                         layer_router_entropy,
                         layer_expert_balance,
                         layer_router_values,
                         total_router_values,
-                    ) = model(x_val, y_val, return_logits=False, aux_coeff=args.aux_coeff_val)
+                    ) = model(
+                        x_val,
+                        y_val,
+                        return_logits=False,
+                        aux_coeff=args.aux_coeff_val,
+                        diff_topk_reg_coeff=diff_topk_reg_coeff,
+                    )
                     val_loss += loss.detach()
                     val_ce_loss += ce_loss.detach()
                     val_aux_loss += total_aux.detach()
@@ -1202,6 +1273,7 @@ for step in range(start_step, args.num_iterations + 1):
                     val_expert_balance = val_expert_balance + expert_balance.detach()
                     val_layer_router_entropy = val_layer_router_entropy + layer_router_entropy.detach()
                     val_layer_expert_balance = val_layer_expert_balance + layer_expert_balance.detach()
+                    val_diff_topk_reg = val_diff_topk_reg + total_diff_topk_reg.detach()
                     for key in ROUTER_VALUE_KEYS:
                         val_layer_router_values[key] = val_layer_router_values[key] + layer_router_values[key].detach()
                         val_total_router_values[key] = val_total_router_values[key] + total_router_values[key].detach()
@@ -1209,9 +1281,11 @@ for step in range(start_step, args.num_iterations + 1):
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         dist.all_reduce(val_ce_loss, op=dist.ReduceOp.AVG)
         dist.all_reduce(val_aux_loss, op=dist.ReduceOp.AVG)
+        dist.all_reduce(val_diff_topk_reg, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         val_ce_loss /= val_steps
         val_aux_loss /= val_steps
+        val_diff_topk_reg /= val_steps
         # average and all-reduce router stats
         val_router_entropy = val_router_entropy / val_steps
         val_expert_balance = val_expert_balance / val_steps
@@ -1241,8 +1315,8 @@ for step in range(start_step, args.num_iterations + 1):
         model.zero_grad(set_to_none=True)
         gc.collect()
         with ctx:
-            _, loss_ce, ce_loss_probe, total_aux_probe, _, _, _, _, _, _ = model(
-                x_probe, y_probe, return_logits=False, aux_coeff=0.0
+            _, loss_ce, ce_loss_probe, total_aux_probe, _, _, _, _, _, _, _ = model(
+                x_probe, y_probe, return_logits=False, aux_coeff=0.0, diff_topk_reg_coeff=0.0
             )
         loss_ce.backward()
         ce_router_layer_grad_norms = []
@@ -1259,7 +1333,9 @@ for step in range(start_step, args.num_iterations + 1):
         model.zero_grad(set_to_none=True)
         gc.collect()
         with ctx:
-            _, _, _, total_aux_probe, _, _, _, _, _, _ = model(x_probe, y_probe, return_logits=False, aux_coeff=0.0)
+            _, _, _, total_aux_probe, _, _, _, _, _, _, _ = model(
+                x_probe, y_probe, return_logits=False, aux_coeff=0.0, diff_topk_reg_coeff=0.0
+            )
         # Backprop aux explicitly
         total_aux_probe.backward()
         aux_router_layer_grad_norms = []
@@ -1284,8 +1360,12 @@ for step in range(start_step, args.num_iterations + 1):
             with torch.no_grad():
                 with ctx:
                     # Get current expert assignments for tracking sequences
-                    _, _, _, _, _, _, _, _, _, _, current_assignments = model(
-                        tracking_x, return_logits=False, aux_coeff=0.0, return_expert_assignments=True
+                    _, _, _, _, _, _, _, _, _, _, _, current_assignments = model(
+                        tracking_x,
+                        return_logits=False,
+                        aux_coeff=0.0,
+                        diff_topk_reg_coeff=0.0,
+                        return_expert_assignments=True,
                     )
                     # current_assignments shape: (n_layers, 100, seq_len, top_k)
                     sorted_curr_assignments = current_assignments.clone().sort(dim=-1)[0]
@@ -1326,6 +1406,7 @@ for step in range(start_step, args.num_iterations + 1):
                 val_loss,
                 val_ce_loss,
                 val_aux_loss,
+                val_diff_topk_reg,
                 val_router_entropy,
                 training_time_ms,
                 timed_steps,
@@ -1392,7 +1473,14 @@ for step in range(start_step, args.num_iterations + 1):
             cached_batches.append((x.clone(), y.clone()))
             with torch.no_grad():
                 with ctx:
-                    model(x, y, return_logits=False, aux_coeff=0.0, router_context=collect_context)
+                    model(
+                        x,
+                        y,
+                        return_logits=False,
+                        aux_coeff=0.0,
+                        diff_topk_reg_coeff=0.0,
+                        router_context=collect_context,
+                    )
             x, y = train_loader.next_batch()
         dist.all_reduce(tokens_accum, op=dist.ReduceOp.SUM)
         dist.all_reduce(totals_accum, op=dist.ReduceOp.SUM)
@@ -1409,6 +1497,7 @@ for step in range(start_step, args.num_iterations + 1):
     layer_expert_balance_sum = torch.zeros(n_layers, num_experts, device=device)
     layer_router_values_sum = init_layer_router_value_tensors(n_layers, device=device)
     total_router_values_sum = init_total_router_value_tensors(device=device)
+    diff_topk_reg_sum = torch.tensor(0.0, device=device)
     for i in range(1, train_accumulation_steps+1):
         if use_global_lb:
             x_batch, y_batch = cached_batches[i-1]
@@ -1421,6 +1510,7 @@ for step in range(start_step, args.num_iterations + 1):
                 loss,
                 ce_loss,
                 total_aux,
+                total_diff_topk_reg,
                 router_entropy,
                 expert_balance,
                 layer_router_entropy,
@@ -1428,9 +1518,15 @@ for step in range(start_step, args.num_iterations + 1):
                 layer_router_values,
                 total_router_values,
             ) = model(
-                x_batch, y_batch, return_logits=False, aux_coeff=args.aux_coeff_train, router_context=router_context_use
+                x_batch,
+                y_batch,
+                return_logits=False,
+                aux_coeff=args.aux_coeff_train,
+                diff_topk_reg_coeff=diff_topk_reg_coeff,
+                router_context=router_context_use,
             )
             train_loss = loss.detach()
+            diff_topk_reg_sum = diff_topk_reg_sum + total_diff_topk_reg.detach()
             router_entropy_sum = router_entropy_sum + router_entropy.detach()
             expert_balance_sum = expert_balance_sum + expert_balance.detach()
             layer_router_entropy_sum = layer_router_entropy_sum + layer_router_entropy.detach()
@@ -1482,10 +1578,12 @@ for step in range(start_step, args.num_iterations + 1):
     total_router_values_avg = {
         key: total_router_values_sum[key] / train_accumulation_steps for key in ROUTER_VALUE_KEYS
     }
+    diff_topk_reg_avg = diff_topk_reg_sum / train_accumulation_steps
     dist.all_reduce(router_entropy_avg, op=dist.ReduceOp.AVG)
     dist.all_reduce(expert_balance_avg, op=dist.ReduceOp.AVG)
     dist.all_reduce(layer_router_entropy_avg, op=dist.ReduceOp.AVG)
     dist.all_reduce(layer_expert_balance_avg, op=dist.ReduceOp.AVG)
+    dist.all_reduce(diff_topk_reg_avg, op=dist.ReduceOp.AVG)
     for key in ROUTER_VALUE_KEYS:
         dist.all_reduce(layer_router_values_avg[key], op=dist.ReduceOp.AVG)
         dist.all_reduce(total_router_values_avg[key], op=dist.ReduceOp.AVG)
@@ -1500,6 +1598,7 @@ for step in range(start_step, args.num_iterations + 1):
         wandb_train_log(
             step + 1,
             train_loss,
+            diff_topk_reg_avg,
             router_entropy_avg,
             grad_norm,
             approx_time,
@@ -1514,6 +1613,7 @@ for step in range(start_step, args.num_iterations + 1):
             raw_model,
             num_experts,
             ROUTER_VALUE_KEYS,
+            diff_topk_reg_coeff,
         )
 
 if master_process:

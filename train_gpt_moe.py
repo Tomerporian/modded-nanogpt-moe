@@ -28,11 +28,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
 from wandb_logging import init_wandb, wandb_train_log, wandb_val_log
 from params import parse_args
-from optimizers import Muon
+from optimizers import get_optimizers
 from logger import setup_default_logging
-
-# Import Megatron dataloader for indexed datasets
-from megatron_indexed_dataset import MegatronDataLoader
+from data.dataloaders import create_dataloader
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -314,7 +312,7 @@ class MoE(nn.Module):
 
     def _compute_diff_topk_regularizer(self, logits):
         if self.diff_topk_reg_fp32:
-            logits.float()
+            logits = logits.float()
         
         num_experts = logits.size(-1)
         kth_smallest_idx = num_experts - self.top_k
@@ -522,7 +520,15 @@ class Block(nn.Module):
     def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None):
         x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
         if return_expert_assignments:
-            mlp_out, aux, router_entropy, expert_balance, router_value_stats, diff_topk_reg, expert_assignments = self.mlp(
+            (
+                mlp_out,
+                aux,
+                router_entropy,
+                expert_balance,
+                router_value_stats,
+                diff_topk_reg,
+                expert_assignments,
+            ) = self.mlp(
                 F.rms_norm(x, (x.size(-1),)), token_idx, return_expert_assignments=True, router_context=router_context
             )
             x = x + mlp_out
@@ -693,209 +699,6 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             block.mlp.finalize_loss_free_update()
 
-# -----------------------------------------------------------------------------
-# Our own simple Distributed Data Loader
-
-def _peek_data_shard(filename):
-    # only reads the header, returns header data
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
-    if header[0] != 20240520:
-        logging.info("ERROR: magic number mismatch in the data .bin file!")
-        logging.info("---> HINT: Are you passing in a correct file with --input_bin?")
-        logging.info("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
-        logging.info("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
-        exit(1)
-    assert header[1] == 1, "unsupported version"
-    ntok = header[2] # number of tokens (claimed)
-    return ntok # for now just return the number of tokens
-
-def _load_data_shard(filename):
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
-        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-        assert header[1] == 1, "unsupported version"
-        ntok = header[2] # number of tokens (claimed)
-        # the rest of it are tokens, stored as uint16
-        tokens = np.frombuffer(f.read(), dtype=np.uint16)
-    assert len(tokens) == ntok, "number of tokens read does not match header?"
-    return tokens
-
-class DistributedDataLoader:
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        self.B = B
-        self.T = T
-
-        # glob files that match the pattern
-        self.files = sorted(glob.glob(filename_pattern))
-        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
-
-        # determine file format based on path
-        if 'fineweb10B' in filename_pattern:
-            self.file_format = 'fineweb'
-            self.header_size = 256 * 4  # 256 int32 values
-            self.dtype = np.uint16
-        elif 'tokenized_owt' in filename_pattern:
-            self.file_format = 'openwebtext'
-            self.header_size = 0  # no header
-            self.dtype = np.uint16
-        elif 'tokenized_c4' in filename_pattern:
-            self.file_format = 'c4'
-            self.header_size = 0  # no header
-            self.dtype = np.uint8
-        else:
-            raise ValueError(f"Unknown dataset format for pattern: {filename_pattern}")
-
-        # validate all data shards and get lengths
-        self.shard_lengths = []
-        ntok_total = 0
-        
-        for fname in self.files:
-            if self.file_format == 'fineweb':
-                # peek to get the number of tokens and validate format
-                shard_ntok = _peek_data_shard(fname)
-            else:  # openwebtext or c4
-                # calculate tokens from file size
-                import os
-                file_size = os.path.getsize(fname)
-                # token size depends on dtype
-                token_size = np.dtype(self.dtype).itemsize
-                shard_ntok = file_size // token_size
-
-            self.shard_lengths.append(shard_ntok)
-            ntok_total += int(shard_ntok)
-        
-        self.ntok_total = ntok_total
-
-        # create cumulative lengths for sampling across shards (use int64 to avoid overflow)
-        # subtract T from each shard length to ensure we never sample too close to the end
-        self.cumulative_lengths = []
-        cumsum = 0
-        for length in self.shard_lengths:
-            # Ensure we have at least T+1 tokens available for sampling
-            effective_length = max(0, int(length) - self.T)
-            cumsum += effective_length
-            self.cumulative_lengths.append(cumsum)
-
-        # Update total tokens to reflect the effective sampling space
-        self.ntok_total = cumsum
-
-    def next_batch(self):
-        B = self.B
-        T = self.T
-        
-        # Sample all random positions at once (like Diff_topK_nanoMoE)
-        random_positions = torch.randint(0, self.ntok_total - T, (B,))
-        
-        # Map positions to (shard_idx, pos_in_shard) for each sequence
-        shard_info = []
-        for pos in random_positions:
-            pos = pos.item()
-            # Find which shard contains this position
-            shard_idx = 0
-            for i, cum_len in enumerate(self.cumulative_lengths):
-                if pos < cum_len:
-                    shard_idx = i
-                    break
-            
-            # Calculate position within the shard
-            if shard_idx == 0:
-                pos_in_shard = pos
-            else:
-                pos_in_shard = pos - self.cumulative_lengths[shard_idx - 1]
-
-            # Note: pos_in_shard is now guaranteed to be valid since we excluded
-            # the last T tokens from each shard during cumulative length calculation
-            
-            shard_info.append((shard_idx, pos_in_shard))
-        
-        # Extract sequences (similar to Diff_topK_nanoMoE list comprehension style)
-        x_list = []
-        y_list = []
-        
-        for shard_idx, pos_in_shard in shard_info:
-            # Recreate memmap to avoid memory leak (like Diff_topK_nanoMoE)
-            tokens = np.memmap(self.files[shard_idx], dtype=self.dtype, mode='r', offset=self.header_size)
-            seq = tokens[pos_in_shard:pos_in_shard + T + 1]
-            x_list.append(torch.from_numpy(seq[:T].astype(np.int64)))      # inputs
-            y_list.append(torch.from_numpy(seq[1:T+1].astype(np.int64)))   # targets
-        
-        x = torch.stack(x_list)
-        y = torch.stack(y_list)
-
-        return x.cuda(), y.cuda()
-
-
-def is_megatron_dataset(path_pattern):
-    """
-    Detect if the path refers to a Megatron indexed dataset.
-
-    Returns True if:
-    - Path has no wildcards (not a glob pattern)
-    - Corresponding .idx file exists
-    """
-    # If there are wildcards, it's a multi-file dataset (fineweb/owt style)
-    if '*' in path_pattern or '?' in path_pattern:
-        return False
-
-    # Check if .idx file exists (Megatron format)
-    # Handle both cases: path ends with .bin or not
-    if path_pattern.endswith('.bin'):
-        idx_path = path_pattern[:-4] + '.idx'
-    else:
-        idx_path = path_pattern + '.idx'
-
-    return os.path.exists(idx_path)
-
-
-def create_dataloader(path_pattern, B, T, ddp_rank, ddp_world_size, split='train'):
-    """
-    Create appropriate dataloader based on dataset format.
-
-    - Megatron indexed datasets (.idx/.bin): Use MegatronDataLoader with split support
-    - Multi-file datasets (*.bin): Use DistributedDataLoader
-
-    Args:
-        path_pattern: Path to dataset (with wildcards for multi-file, or path for indexed)
-        B: Batch size
-        T: Sequence length
-        ddp_rank: DDP rank
-        ddp_world_size: Number of DDP processes
-        split: For Megatron datasets, which split to use ('train', 'val', 'test')
-    """
-    if is_megatron_dataset(path_pattern):
-        # Remove .bin extension if present for Megatron loader
-        if path_pattern.endswith('.bin'):
-            path_pattern = path_pattern[:-4]
-
-        if ddp_rank == 0:
-            logging.info(f"Using MegatronDataLoader for indexed dataset: {path_pattern}, split: {split}")
-
-        return MegatronDataLoader(
-            dataset_path=path_pattern,
-            B=B,
-            T=T,
-            process_rank=ddp_rank,
-            num_processes=ddp_world_size,
-            split=split
-        )
-    else:
-        if ddp_rank == 0:
-            logging.info(f"Using DistributedDataLoader for multi-file dataset: {path_pattern}")
-
-        return DistributedDataLoader(
-            filename_pattern=path_pattern,
-            B=B,
-            T=T,
-            process_rank=ddp_rank,
-            num_processes=ddp_world_size
-        )
-
-
 setup_default_logging()
 
 
@@ -1025,69 +828,7 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-all_h_params = list(raw_model.transformer.h.parameters())
-adamw_betas = tuple(args.adamw_betas)
-adamw_fused = args.adamw_fused
-optimizer1 = torch.optim.AdamW([raw_model.transformer.wte.weight], lr=args.lr_embed, betas=adamw_betas, weight_decay=args.weight_decay, fused=adamw_fused)
-optimizer2 = torch.optim.AdamW([raw_model.lm_head.weight], lr=args.lr_head, betas=adamw_betas, weight_decay=args.weight_decay, fused=adamw_fused)
-router_optimizer = None
-router_temperature_optimizer = None
-
-def _collect_router_temperature_params():
-    temperature_params = []
-    if not raw_model.config.use_router_temperature:
-        return temperature_params
-    for block in raw_model.transformer.h:
-        temp_param = getattr(block.mlp, 'router_temperature_log', None)
-        if isinstance(temp_param, nn.Parameter):
-            temperature_params.append(temp_param)
-    return temperature_params
-
-router_temperature_params = _collect_router_temperature_params()
-if router_temperature_params:
-    temp_param_ids = {id(p) for p in router_temperature_params}
-    all_h_params = [p for p in all_h_params if id(p) not in temp_param_ids]
-
-def _collect_router_params():
-    router_params_local = []
-    for block in raw_model.transformer.h:
-        router_module = getattr(block.mlp, 'router', None)
-        if router_module is not None:
-            router_params_local.extend(list(router_module.parameters()))
-    return router_params_local
-
-if args.only_router_muon:
-    router_params = _collect_router_params()
-    router_optimizer = Muon(router_params, lr=args.lr_muon, momentum=args.momentum, backend=args.muon_svd_backend, nesterov=args.muon_nesterov, backend_steps=args.muon_backend_steps)
-    router_param_ids = {id(p) for p in router_params}
-    blocks_params = [p for p in all_h_params if id(p) not in router_param_ids]
-
-    optimizer3 = torch.optim.AdamW(blocks_params, lr=6e-4, betas=adamw_betas, weight_decay=args.weight_decay, fused=adamw_fused)
-elif args.use_adamw_opt3:
-    optimizer3 = torch.optim.AdamW(all_h_params, lr=6e-4, betas=adamw_betas, weight_decay=args.weight_decay, fused=adamw_fused)
-elif args.use_adamw_router:
-    router_params = _collect_router_params()
-    router_optimizer = torch.optim.AdamW(router_params, lr=args.lr_muon, betas=adamw_betas, weight_decay=args.weight_decay, fused=adamw_fused)
-    router_param_ids = {id(p) for p in router_params}
-    muon_params = [p for p in all_h_params if id(p) not in router_param_ids]
-    
-    optimizer3 = Muon(muon_params, lr=args.lr_muon, momentum=args.momentum, backend=args.muon_svd_backend, nesterov=args.muon_nesterov, backend_steps=args.muon_backend_steps)
-else:
-    optimizer3 = Muon(all_h_params, lr=args.lr_muon, momentum=args.momentum, backend=args.muon_svd_backend, nesterov=args.muon_nesterov, backend_steps=args.muon_backend_steps)
-if router_temperature_params:
-    router_temperature_optimizer = torch.optim.AdamW(
-        router_temperature_params,
-        lr=args.lr_muon,
-        betas=adamw_betas,
-        weight_decay=args.weight_decay,
-        fused=adamw_fused,
-    )
-
-optimizers = [optimizer1, optimizer2, optimizer3]
-if router_optimizer is not None:
-    optimizers.append(router_optimizer)
-if router_temperature_optimizer is not None:
-    optimizers.append(router_temperature_optimizer)
+optimizers, router_optimizer, router_temperature_optimizer = get_optimizers(raw_model, args)
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -1170,7 +911,7 @@ if master_process:
         f.write(args_text)
     init_wandb(
         args,
-        optimizer3,
+        optimizers[2],
         train_accumulation_steps,
         val_steps,
         ddp_world_size,
@@ -1473,14 +1214,7 @@ for step in range(start_step, args.num_iterations + 1):
             cached_batches.append((x.clone(), y.clone()))
             with torch.no_grad():
                 with ctx:
-                    model(
-                        x,
-                        y,
-                        return_logits=False,
-                        aux_coeff=0.0,
-                        diff_topk_reg_coeff=0.0,
-                        router_context=collect_context,
-                    )
+                    model(x, y, return_logits=False, aux_coeff=0.0, diff_topk_reg_coeff=0.0, router_context=collect_context)
             x, y = train_loader.next_batch()
         dist.all_reduce(tokens_accum, op=dist.ReduceOp.SUM)
         dist.all_reduce(totals_accum, op=dist.ReduceOp.SUM)

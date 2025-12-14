@@ -2,6 +2,7 @@ import os
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 
 
 def zeropower_via_svd(G, steps=None):
@@ -77,4 +78,134 @@ class Muon(torch.optim.Optimizer):
                 curr_idx += p.numel()
 
 
-__all__ = ["Muon"]
+def _collect_router_temperature_params(raw_model):
+    temperature_params = []
+    if not getattr(raw_model.config, "use_router_temperature", False):
+        return temperature_params
+    for block in raw_model.transformer.h:
+        temp_param = getattr(block.mlp, 'router_temperature_log', None)
+        if isinstance(temp_param, nn.Parameter):
+            temperature_params.append(temp_param)
+    return temperature_params
+
+
+def _collect_router_params(raw_model):
+    router_params = []
+    for block in raw_model.transformer.h:
+        router_module = getattr(block.mlp, 'router', None)
+        if router_module is not None:
+            router_params.extend(list(router_module.parameters()))
+    return router_params
+
+
+def get_optimizers(raw_model, args):
+    """
+    Builds and returns optimizer instances for the current model configuration.
+
+    Returns:
+        optimizers: List[torch.optim.Optimizer]
+        router_optimizer: Optional[torch.optim.Optimizer]
+        router_temperature_optimizer: Optional[torch.optim.Optimizer]
+    """
+    all_h_params = list(raw_model.transformer.h.parameters())
+    adamw_betas = tuple(args.adamw_betas)
+    adamw_fused = args.adamw_fused
+
+    optimizer1 = torch.optim.AdamW(
+        [raw_model.transformer.wte.weight],
+        lr=args.lr_embed,
+        betas=adamw_betas,
+        weight_decay=args.weight_decay,
+        fused=adamw_fused,
+    )
+    optimizer2 = torch.optim.AdamW(
+        [raw_model.lm_head.weight],
+        lr=args.lr_head,
+        betas=adamw_betas,
+        weight_decay=args.weight_decay,
+        fused=adamw_fused,
+    )
+
+    router_optimizer = None
+    router_temperature_optimizer = None
+
+    router_temperature_params = _collect_router_temperature_params(raw_model)
+    if router_temperature_params:
+        temp_param_ids = {id(p) for p in router_temperature_params}
+        all_h_params = [p for p in all_h_params if id(p) not in temp_param_ids]
+
+    if args.only_router_muon:
+        router_params = _collect_router_params(raw_model)
+        router_optimizer = Muon(
+            router_params,
+            lr=args.lr_muon,
+            momentum=args.momentum,
+            backend=args.muon_svd_backend,
+            nesterov=args.muon_nesterov,
+            backend_steps=args.muon_backend_steps,
+        )
+        router_param_ids = {id(p) for p in router_params}
+        blocks_params = [p for p in all_h_params if id(p) not in router_param_ids]
+        optimizer3 = torch.optim.AdamW(
+            blocks_params,
+            lr=6e-4,
+            betas=adamw_betas,
+            weight_decay=args.weight_decay,
+            fused=adamw_fused,
+        )
+    elif args.use_adamw_opt3:
+        optimizer3 = torch.optim.AdamW(
+            all_h_params,
+            lr=6e-4,
+            betas=adamw_betas,
+            weight_decay=args.weight_decay,
+            fused=adamw_fused,
+        )
+    elif args.use_adamw_router:
+        router_params = _collect_router_params(raw_model)
+        router_optimizer = torch.optim.AdamW(
+            router_params,
+            lr=args.lr_muon,
+            betas=adamw_betas,
+            weight_decay=args.weight_decay,
+            fused=adamw_fused,
+        )
+        router_param_ids = {id(p) for p in router_params}
+        muon_params = [p for p in all_h_params if id(p) not in router_param_ids]
+        optimizer3 = Muon(
+            muon_params,
+            lr=args.lr_muon,
+            momentum=args.momentum,
+            backend=args.muon_svd_backend,
+            nesterov=args.muon_nesterov,
+            backend_steps=args.muon_backend_steps,
+        )
+    else:
+        optimizer3 = Muon(
+            all_h_params,
+            lr=args.lr_muon,
+            momentum=args.momentum,
+            backend=args.muon_svd_backend,
+            nesterov=args.muon_nesterov,
+            backend_steps=args.muon_backend_steps,
+        )
+
+    if router_temperature_params:
+        router_temperature_optimizer = torch.optim.AdamW(
+            router_temperature_params,
+            lr=args.lr_muon,
+            betas=adamw_betas,
+            weight_decay=args.weight_decay,
+            fused=adamw_fused,
+        )
+
+    optimizers = [optimizer1, optimizer2, optimizer3]
+    if router_optimizer is not None:
+        optimizers.append(router_optimizer)
+    if router_temperature_optimizer is not None:
+        optimizers.append(router_temperature_optimizer)
+
+    return optimizers, router_optimizer, router_temperature_optimizer
+
+
+__all__ = ["Muon", "get_optimizers"]

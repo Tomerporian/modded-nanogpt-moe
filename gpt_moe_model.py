@@ -177,6 +177,7 @@ class MoE(nn.Module):
         self.diff_topk_reg_fp32 = config.diff_topk_reg_fp32
         self.diff_topk_reg_enabled = self.router_type == 'diff' and config.diff_topk_reg_max_coeff > 0.0
         self.theta_load_balance_coeff = config.theta_load_balance_coeff
+        self.theta_lb_detach_theta = config.theta_lb_detach_theta
         if self.use_router_temperature:
             self.router_temperature_log = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         else:
@@ -308,7 +309,9 @@ class MoE(nn.Module):
     def _get_detached_lb_theta(self):
         if self.load_balance_theta is None:
             return torch.zeros(self.num_experts, device=self.load_balance_theta.device, dtype=torch.float32)
-        return self.load_balance_theta.detach()
+        if self.theta_lb_detach_theta:
+            return self.load_balance_theta.detach()
+        return self.load_balance_theta
 
     def _compute_theta_load_balance_loss(self, logits):
         num_experts = logits.size(-1)
@@ -590,6 +593,7 @@ class GPTConfig:
     diff_topk_reg_max_coeff : float = 0.0
     diff_topk_reg_fp32 : bool = False
     theta_load_balance_coeff : float = 0.0
+    theta_lb_detach_theta : bool = True
 
 
 class GPT(nn.Module):

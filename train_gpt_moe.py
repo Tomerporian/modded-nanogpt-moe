@@ -144,6 +144,7 @@ model = GPT(GPTConfig(
     diff_topk_reg_max_coeff=args.diff_topk_regularizer_max_coeff,
     diff_topk_reg_fp32=args.diff_topk_regularizer_fp32,
     theta_load_balance_coeff=args.theta_load_balance_coeff,
+    theta_lb_detach_theta=args.theta_lb_detach_theta,
 ))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):

@@ -65,6 +65,24 @@ def log_loss_free_bias(raw_model, prefix):
             log[f'{prefix}_loss_free_bias/Layer {li}/expert_{ei}'] = float(bias_vals[ei].item())
     return log
 
+def log_theta_stats(raw_model, prefix):
+    log = {}
+    if getattr(raw_model.config, "theta_load_balance_coeff", 0) == 0:
+        return log
+    theta_mins = []
+    theta_maxs = []
+    for li, block in enumerate(raw_model.transformer.h):
+        theta_param = getattr(block.mlp, 'load_balance_theta', None)
+        if isinstance(theta_param, torch.nn.Parameter):
+            theta_detached = theta_param.detach().float()
+            theta_mins.append(theta_detached.min())
+            theta_maxs.append(theta_detached.max())
+            log[f'{prefix}/theta/min/Layer {li}'] = float(theta_detached.min().item())
+            log[f'{prefix}/theta/max/Layer {li}'] = float(theta_detached.max().item())
+    if theta_mins:
+        log[f'{prefix}/theta/min'] = float(torch.stack(theta_mins).min().item())
+        log[f'{prefix}/theta/max'] = float(torch.stack(theta_maxs).max().item())
+    return log
 
 def build_router_grad_norm_log(n_layers, ce_grad_norms, aux_grad_norms):
     log = {}
@@ -87,6 +105,7 @@ def wandb_train_log(
     log_step,
     train_loss,
     train_diff_topk_reg,
+    train_theta_lb_loss,
     router_entropy_avg,
     grad_norm,
     approx_time,
@@ -106,6 +125,7 @@ def wandb_train_log(
     log = {
         'train/loss': float(train_loss.item()),
         'train/diff_topk_reg': float(train_diff_topk_reg.item()),
+        'train/theta_lb_loss': float(train_theta_lb_loss.item()),
         'train/router_entropy': float(router_entropy_avg.item()),
         'train/grad_norm': float(grad_norm.item()),
         'train/step_time_ms': float(approx_time),
@@ -122,6 +142,7 @@ def wandb_train_log(
     log.update(log_expert_balance(expert_balance_avg, layer_expert_balance_avg, num_experts, 'train'))
     log.update(log_router_values(layer_router_values_avg, total_router_values_avg, router_value_keys))
     log.update(log_loss_free_bias(raw_model, 'train'))
+    log.update(log_theta_stats(raw_model, 'thetas'))
     log.update(_collect_router_temperatures(raw_model))
     wandb.log(log, step=log_step)
 
@@ -131,6 +152,7 @@ def wandb_val_log(
     val_loss,
     val_ce_loss,
     val_aux_loss,
+    val_theta_lb_loss,
     val_diff_topk_reg,
     val_router_entropy,
     training_time_ms,
@@ -167,6 +189,7 @@ def wandb_val_log(
         'val/loss': _to_float(val_loss),
         'val/ce_loss': _to_float(val_ce_loss),
         'val/aux_loss': _to_float(val_aux_loss),
+        'val/theta_lb_loss': _to_float(val_theta_lb_loss),
         'val/diff_topk_reg': _to_float(val_diff_topk_reg),
         'val/router_entropy': float(val_router_entropy.item()),
         'train/time_ms': float(training_time_ms),

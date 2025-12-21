@@ -57,8 +57,6 @@ def _build_training_parser():
                        help='scale factor applied to the loss-free routing bias')
     group.add_argument('--loss-free-update-rate', default=0.001, type=float,
                        help='per-expert bias update rate for sign-based loss-free routing')
-    group.add_argument('--loss-free-bias-rule', default='ema', type=str, choices=['ema', 'sign'],
-                       help='controls whether router bias uses EMA or sign-step updates')
     group.add_argument('--router-logit-jitter', default=0.0, type=float,
                        help='uniform multiplicative noise width applied to router logits during training')
     group.add_argument('--use-router-temperature', action='store_true', default=False,
@@ -105,6 +103,8 @@ def _build_training_parser():
                        help='learning rate for head layer')
     group.add_argument('--lr-muon', default=0.02, type=float,
                        help='learning rate for muon optimizer (transformer blocks)')
+    group.add_argument('--lr-theta', default=0.1, type=float,
+                       help='learning rate for theta load balance parameters')
     group.add_argument('--momentum', default=0.95, type=float,
                        help='momentum for muon optimizer')
 
@@ -136,6 +136,8 @@ def _build_training_parser():
                        help="warm-up schedule for diff-topk regularizer coefficient")
     group.add_argument('--diff-topk-regularizer-fp32', action='store_true', default=False,
                        help='compute the diff-topk regularizer in fp32 precision')
+    group.add_argument('--theta-load-balance-coeff', default=0.0, type=float,
+                       help='coefficient for the theta-based load balancing loss during training')
 
     # Misc parameters
     group = parser.add_argument_group('Run config')

@@ -98,6 +98,15 @@ def _collect_router_params(raw_model):
     return router_params
 
 
+def _collect_theta_params(raw_model):
+    theta_params = []
+    for block in raw_model.transformer.h:
+        theta_param = getattr(block.mlp, 'load_balance_theta', None)
+        if isinstance(theta_param, nn.Parameter):
+            theta_params.append(theta_param)
+    return theta_params
+
+
 def get_optimizers(raw_model, args):
     """
     Builds and returns optimizer instances for the current model configuration.
@@ -133,6 +142,10 @@ def get_optimizers(raw_model, args):
     if router_temperature_params:
         temp_param_ids = {id(p) for p in router_temperature_params}
         all_h_params = [p for p in all_h_params if id(p) not in temp_param_ids]
+    theta_params = _collect_theta_params(raw_model)
+    if theta_params:
+        theta_param_ids = {id(p) for p in theta_params}
+        all_h_params = [p for p in all_h_params if id(p) not in theta_param_ids]
 
     if args.only_router_muon:
         router_params = _collect_router_params(raw_model)
@@ -190,6 +203,15 @@ def get_optimizers(raw_model, args):
             backend_steps=args.muon_backend_steps,
         )
 
+    theta_optimizer = None
+    if theta_params:
+        theta_optimizer = torch.optim.AdamW(
+            theta_params,
+            lr=args.lr_theta,
+            betas=adamw_betas,
+            weight_decay=0.0,
+            fused=adamw_fused,
+        )
     if router_temperature_params:
         router_temperature_optimizer = torch.optim.AdamW(
             router_temperature_params,
@@ -200,6 +222,8 @@ def get_optimizers(raw_model, args):
         )
 
     optimizers = [optimizer1, optimizer2, optimizer3]
+    if theta_optimizer is not None:
+        optimizers.append(theta_optimizer)
     if router_optimizer is not None:
         optimizers.append(router_optimizer)
     if router_temperature_optimizer is not None:

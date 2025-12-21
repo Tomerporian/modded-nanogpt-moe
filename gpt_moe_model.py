@@ -171,21 +171,24 @@ class MoE(nn.Module):
         self.loss_free_decay = config.loss_free_decay
         self.loss_free_strength = config.loss_free_strength
         self.loss_free_update_rate = config.loss_free_update_rate
-        self.loss_free_bias_rule = config.loss_free_bias_rule
         self.router_logit_jitter = config.router_logit_jitter
         self.use_router_temperature = config.use_router_temperature
         self.aux_use_routed_prob = config.aux_use_routed_prob
         self.diff_topk_reg_fp32 = config.diff_topk_reg_fp32
         self.diff_topk_reg_enabled = self.router_type == 'diff' and config.diff_topk_reg_max_coeff > 0.0
+        self.theta_load_balance_coeff = config.theta_load_balance_coeff
         if self.use_router_temperature:
             self.router_temperature_log = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         else:
             self.register_parameter('router_temperature_log', None)
+        if self.theta_load_balance_coeff > 0.0:
+            self.load_balance_theta = nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32))
+        else:
+            self.register_parameter('load_balance_theta', None)
 
         assert self.router_type in ('hash', 'switch', 'diff', 'diff_no_softmax')
         assert self.router_activation in ('gelu', 'relu', 'relu_squared')
         assert self.loss_free_mode in ('none', 'deepseek', 'stopgrad')
-        assert self.loss_free_bias_rule in ('ema', 'sign')
         assert self.router_logit_jitter >= 0.0, "router_logit_jitter must be non-negative"
         if self.router_type == 'hash' and self.loss_free_mode != 'none':
             raise ValueError("Loss-free load balancing requires a learned router (switch or diff).")
@@ -194,7 +197,6 @@ class MoE(nn.Module):
 
         self.experts = nn.ModuleList([MLP(config) for _ in range(self.num_experts)])
         init_frac = torch.full((self.num_experts,), 1.0 / self.num_experts, dtype=torch.float32)
-        self.register_buffer('loss_free_ema', init_frac, persistent=True)
         self.register_buffer('loss_free_bias_state', torch.zeros(self.num_experts, dtype=torch.float32), persistent=True)
         self.register_buffer('loss_free_tokens_accum', torch.zeros(self.num_experts, dtype=torch.float32), persistent=False)
         self.register_buffer('loss_free_total_accum', torch.tensor(0.0, dtype=torch.float32), persistent=False)
@@ -235,10 +237,7 @@ class MoE(nn.Module):
     def _loss_free_bias_vector(self):
         if not self.loss_free_enabled:
             return None
-        if self.loss_free_bias_rule == 'sign':
-            bias_vec = self.loss_free_bias_state * self.loss_free_strength
-        else:
-            bias_vec = (1.0 / self.num_experts - self.loss_free_ema) * self.loss_free_strength
+        bias_vec = self.loss_free_bias_state * self.loss_free_strength
         return bias_vec - bias_vec.mean()
 
     def _loss_free_bias(self, logits):
@@ -288,6 +287,9 @@ class MoE(nn.Module):
         self.loss_free_override_frac = None
 
     def _compute_diff_topk_regularizer(self, logits):
+        if not self.diff_topk_reg_enabled:
+            return torch.tensor(0.0, device=logits.device, dtype=torch.float32)
+        
         if self.diff_topk_reg_fp32:
             logits = logits.float()
         
@@ -302,6 +304,27 @@ class MoE(nn.Module):
         ratio = trunc_mass / (total_mass + 1e-8)
         reg = -torch.log(torch.clamp(ratio, min=1e-8))
         return reg.mean()
+    
+    def _get_detached_lb_theta(self):
+        if self.load_balance_theta is None:
+            return torch.zeros(self.num_experts, device=self.load_balance_theta.device, dtype=torch.float32)
+        return self.load_balance_theta.detach()
+
+    def _compute_theta_load_balance_loss(self, logits):
+        num_experts = logits.size(-1)
+
+        # Detach router logits so gradients flow only into theta.
+        # logits_detached = logits.reshape(-1, num_experts).float()
+        logits_detached = logits.detach().reshape(-1, num_experts).float()
+        token_count = logits_detached.shape[0]
+        x_tilde = logits_detached + self.load_balance_theta
+        kth_smallest_idx = num_experts - self.top_k
+        m_xt = torch.kthvalue(x_tilde, k=kth_smallest_idx, dim=1).values.unsqueeze(1)
+        at_top = torch.relu(x_tilde - m_xt)
+        at_bottom = torch.relu(m_xt - x_tilde)
+        scale = (num_experts - self.top_k) / self.top_k
+        balanced = at_top * scale + at_bottom
+        return balanced.sum() / float(token_count)
 
     def finalize_loss_free_update(self):
         if not self.loss_free_enabled:
@@ -320,66 +343,86 @@ class MoE(nn.Module):
             if total_val > 0:
                 frac = tokens / total_val
         if frac is not None:
-            if self.loss_free_bias_rule == 'sign':
-                self._update_sign_bias(frac)
-            elif self.loss_free_bias_rule == 'ema':
-                self._update_loss_free_state(frac)
+            self._update_sign_bias(frac)
         self._reset_loss_free_accumulators()
+        
+    def run_hash_routing(self, token_idx, x):
+        topk_idx, probs, gate = hash_select(token_idx, self.num_experts)
+        gate = gate.to(x.dtype)
+        probs = probs.to(x.dtype)
+        B, T, C = x.shape
+        BT      = B * T
+        x_flat  = x.reshape(BT, C)
+        y_flat  = torch.zeros_like(x_flat)
+
+        gate_flat = gate.reshape(BT, self.top_k)  # Now always (BT, k)
+        idx_flat = topk_idx.reshape(BT, self.top_k)
+        for expert_id in range(self.num_experts):
+            sel_mask = (idx_flat == expert_id)
+            token_rows, which_k = torch.nonzero(sel_mask, as_tuple=True)
+            inp   = x_flat.index_select(0, token_rows)
+            out   = self.experts[expert_id](inp)
+            coeff = gate_flat[token_rows, which_k].unsqueeze(1)
+            y_flat.index_add_(0, token_rows, out * coeff)
+
+        y = y_flat.view_as(x)
+        return y, None, None, None, None, None, None
 
     def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None):
+        if self.router_type == "hash":
+            return self.run_hash_routing(token_idx, x)
 
         ctx_mode = router_context.get('mode', None) if router_context is not None else None
-        logits = None
         logits_for_selection = None
-        logits_for_weights = None
-        logits_for_stats = None
-        routed_probs_for_aux = None
-        if self.router_type in ("switch", "diff", "diff_no_softmax"):
-            logits = self.router(x)
-            if self.training and self.router_logit_jitter > 0.0:
-                noise = torch.empty_like(logits).uniform_(
-                    1.0 - self.router_logit_jitter,
-                    1.0 + self.router_logit_jitter,
-                )
-                logits = logits * noise
-            bias = self._loss_free_bias(logits)
-            if self.loss_free_mode == 'deepseek' and bias is not None:
-                logits_for_selection = logits + bias
-                logits_for_weights = logits
-            elif self.loss_free_mode == 'stopgrad' and bias is not None:
-                bias_detached = bias.detach()
-                logits_for_selection = logits + bias_detached
-                logits_for_weights = logits_for_selection
-            else:
-                logits_for_selection = logits
-                logits_for_weights = logits
+        theta_lb_loss = torch.tensor(0.0, device=x.device, dtype=torch.float32)
 
-            if self.use_router_temperature:
-                temperature = self._get_router_temperature(logits_for_selection)
-                logits_for_selection = logits_for_selection / temperature
-                logits_for_weights = logits_for_weights / temperature
-            logits_for_stats = logits_for_weights
+        logits = self.router(x)
+        if self.training and self.router_logit_jitter > 0.0:
+            noise = torch.empty_like(logits).uniform_(
+                1.0 - self.router_logit_jitter,
+                1.0 + self.router_logit_jitter,
+            )
+            logits = logits * noise
+        bias = self._loss_free_bias(logits)
+        if self.loss_free_mode == 'deepseek':
+            logits_for_selection = logits + bias
+        elif self.loss_free_mode == 'stopgrad':
+            bias_detached = bias.detach()
+            logits_for_selection = logits + bias_detached
+            logits = logits_for_selection
+        else:
+            logits_for_selection = logits
+        if self.use_router_temperature:
+            temperature = self._get_router_temperature(logits_for_selection)
+            logits_for_selection = logits_for_selection / temperature
+            logits = logits / temperature
+        
+        if self.load_balance_theta is None:
+            theta_lb_loss = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
+        else:
+            theta_lb_loss = self._compute_theta_load_balance_loss(logits)
+            lb_theta = self._get_detached_lb_theta()
+            logits_for_selection = logits_for_selection + lb_theta
+            logits = logits_for_selection
+
         if self.router_type == "switch":
-            router_probs = logits_for_stats.softmax(dim=-1)
+            router_probs = logits.softmax(dim=-1)
             topk_idx, routed_probs_for_aux, gate = switch_topk(
                 logits_for_selection,
                 self.top_k,
-                weight_logits=logits_for_weights,
+                weight_logits=logits,
                 probs_override=router_probs,
             )
             probs = router_probs
         elif self.router_type == "diff":
             topk_idx, routed_probs_for_aux, gate = diff_routing(logits_for_selection, self.top_k)
-            probs = logits_for_weights.softmax(dim=-1)
+            probs = logits.softmax(dim=-1)
         elif self.router_type == "diff_no_softmax":
             topk_idx, routed_probs_for_aux, gate = diff_no_softmax(logits_for_selection, self.top_k)
-            probs = logits_for_weights.softmax(dim=-1)
-        elif self.router_type == "hash":
-            topk_idx, probs, gate = hash_select(token_idx, self.num_experts)
-            gate = gate.to(x.dtype)
-            probs = probs.to(x.dtype)
+            probs = logits.softmax(dim=-1)
         else:
             raise ValueError(f"unknown routing type: {self.router_type}")
+        
         B, T, C = x.shape
         BT      = B * T
         x_flat  = x.reshape(BT, C)
@@ -406,19 +449,14 @@ class MoE(nn.Module):
             else:
                 top2_coef_vals = torch.zeros_like(top1_coef_vals)
 
-            if logits_for_selection is not None:
-                logits_flat = logits_for_selection.reshape(BT, self.num_experts).float()
-                num_top_logits = 2 if logits_flat.size(1) >= 2 else 1
-                top_logits = torch.topk(logits_flat, k=num_top_logits, dim=-1).values
-                top1_logits_vals = top_logits[:, 0]
-                if num_top_logits == 2:
-                    top2_logits_vals = top_logits[:, 1]
-                else:
-                    top2_logits_vals = torch.zeros_like(top1_logits_vals)
+            logits_flat = logits_for_selection.reshape(BT, self.num_experts).float()
+            num_top_logits = 2 if logits_flat.size(1) >= 2 else 1
+            top_logits = torch.topk(logits_flat, k=num_top_logits, dim=-1).values
+            top1_logits_vals = top_logits[:, 0]
+            if num_top_logits == 2:
+                top2_logits_vals = top_logits[:, 1]
             else:
-                zero_vals = torch.zeros(BT, device=x.device, dtype=torch.float32)
-                top1_logits_vals = zero_vals
-                top2_logits_vals = zero_vals
+                top2_logits_vals = torch.zeros_like(top1_logits_vals)
 
             router_value_stats = {
                 'top1_logit': top1_logits_vals.mean(),
@@ -429,10 +467,7 @@ class MoE(nn.Module):
                 'coef_diff': (top1_coef_vals - top2_coef_vals).mean(),
             }
 
-        if self.diff_topk_reg_enabled and logits_for_selection is not None:
-            diff_topk_reg = self._compute_diff_topk_regularizer(logits_for_selection)
-        else:
-            diff_topk_reg = torch.tensor(0.0, device=x.device, dtype=torch.float32)
+        diff_topk_reg = self._compute_diff_topk_regularizer(logits_for_selection)
 
         # aux loss and router statistics
         with torch.autocast(device_type="cpu", enabled=False):
@@ -466,23 +501,27 @@ class MoE(nn.Module):
                 token_H = -(probs_flat * (probs_flat + eps).log()).sum(-1)
                 router_entropy = token_H.mean() / math.log(float(self.num_experts))
             # Switch paper:  L_aux = E * <load,prob>
-            if self.router_type != "hash":
-                if self.aux_use_routed_prob and routed_probs_for_aux is not None:
-                    probs_full = routed_probs_for_aux.reshape(-1, self.num_experts)
-                else:
-                    probs_full = logits_for_stats.softmax(dim=-1).reshape(-1, self.num_experts)
-                frac_for_aux = global_frac_override if global_frac_override is not None else frac
-                probs_mean = probs_full.mean(0)
-                aux = self.num_experts * (frac_for_aux * probs_mean).sum()
-            elif self.router_type == "hash":
-                aux = torch.tensor(0.0, device=x.device, requires_grad=self.training)
+            if self.aux_use_routed_prob:
+                probs_full = routed_probs_for_aux.reshape(-1, self.num_experts)
             else:
-                raise ValueError(f"unknown routing type: {self.router_type}")
+                probs_full = logits.softmax(dim=-1).reshape(-1, self.num_experts)
+            frac_for_aux = global_frac_override if global_frac_override is not None else frac
+            probs_mean = probs_full.mean(0)
+            aux = self.num_experts * (frac_for_aux * probs_mean).sum()
 
         if return_expert_assignments:
-            return y, aux, router_entropy, frac, router_value_stats, diff_topk_reg, topk_idx.view_as(x[:, :, :self.top_k])
+            return (
+                y,
+                aux,
+                router_entropy,
+                frac,
+                router_value_stats,
+                diff_topk_reg,
+                theta_lb_loss,
+                topk_idx.view_as(x[:, :, :self.top_k]),
+            )
         else:
-            return y, aux, router_entropy, frac, router_value_stats, diff_topk_reg
+            return y, aux, router_entropy, frac, router_value_stats, diff_topk_reg, theta_lb_loss
 
 
 class Block(nn.Module):
@@ -504,18 +543,28 @@ class Block(nn.Module):
                 expert_balance,
                 router_value_stats,
                 diff_topk_reg,
+                theta_lb_loss,
                 expert_assignments,
             ) = self.mlp(
                 F.rms_norm(x, (x.size(-1),)), token_idx, return_expert_assignments=True, router_context=router_context
             )
             x = x + mlp_out
-            return x, aux, router_entropy, expert_balance, router_value_stats, diff_topk_reg, expert_assignments
+            return (
+                x,
+                aux,
+                router_entropy,
+                expert_balance,
+                router_value_stats,
+                diff_topk_reg,
+                theta_lb_loss,
+                expert_assignments,
+            )
         else:
-            mlp_out, aux, router_entropy, expert_balance, router_value_stats, diff_topk_reg = self.mlp(
+            mlp_out, aux, router_entropy, expert_balance, router_value_stats, diff_topk_reg, theta_lb_loss = self.mlp(
                 F.rms_norm(x, (x.size(-1),)), token_idx, router_context=router_context
             )
             x = x + mlp_out
-            return x, aux, router_entropy, expert_balance, router_value_stats, diff_topk_reg
+            return x, aux, router_entropy, expert_balance, router_value_stats, diff_topk_reg, theta_lb_loss
 
 
 @dataclass
@@ -536,11 +585,11 @@ class GPTConfig:
     loss_free_decay : float = 0.99
     loss_free_strength : float = 1.0
     loss_free_update_rate : float = 0.001
-    loss_free_bias_rule : str = 'ema'
     router_logit_jitter : float = 0.0
     use_router_temperature : bool = False
     diff_topk_reg_max_coeff : float = 0.0
     diff_topk_reg_fp32 : bool = False
+    theta_load_balance_coeff : float = 0.0
 
 
 class GPT(nn.Module):
@@ -574,6 +623,7 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         total_aux = 0
         total_diff_topk_reg = torch.tensor(0.0, device=x.device, dtype=torch.float32)
+        total_theta_lb = torch.tensor(0.0, device=x.device, dtype=torch.float32)
         total_router_entropy = 0
         total_expert_balance = None
         per_layer_router_entropy = []
@@ -589,17 +639,27 @@ class GPT(nn.Module):
                     expert_balance,
                     router_value_stats,
                     diff_topk_reg,
+                    theta_lb_loss,
                     expert_assignments,
                 ) = block(
                     x, idx, return_expert_assignments=True, router_context=router_context
                 )
                 all_layer_expert_assignments.append(expert_assignments)
             else:
-                x, aux, router_entropy, expert_balance, router_value_stats, diff_topk_reg = block(
+                (
+                    x,
+                    aux,
+                    router_entropy,
+                    expert_balance,
+                    router_value_stats,
+                    diff_topk_reg,
+                    theta_lb_loss,
+                ) = block(
                     x, idx, router_context=router_context
                 )
             total_aux = total_aux + aux
             total_diff_topk_reg = total_diff_topk_reg + diff_topk_reg
+            total_theta_lb = total_theta_lb + theta_lb_loss
             total_router_entropy = total_router_entropy + router_entropy
             if total_expert_balance is None:
                 total_expert_balance = expert_balance
@@ -627,7 +687,13 @@ class GPT(nn.Module):
             logits = self.lm_head(x)
             logits = logits.float() # use tf32/fp32 for logits
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            loss = ce_loss + total_aux * aux_coeff + total_diff_topk_reg * diff_topk_reg_coeff
+            theta_coeff = getattr(self.config, 'theta_load_balance_coeff', 0.0)
+            loss = (
+                ce_loss
+                + total_aux * aux_coeff
+                + total_diff_topk_reg * diff_topk_reg_coeff
+                + total_theta_lb * theta_coeff
+            )
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -648,6 +714,7 @@ class GPT(nn.Module):
                 ce_loss,
                 total_aux,
                 total_diff_topk_reg,
+                total_theta_lb,
                 avg_router_entropy,
                 avg_expert_balance,
                 layer_router_entropy,
@@ -663,6 +730,7 @@ class GPT(nn.Module):
                 ce_loss,
                 total_aux,
                 total_diff_topk_reg,
+                total_theta_lb,
                 avg_router_entropy,
                 avg_expert_balance,
                 layer_router_entropy,

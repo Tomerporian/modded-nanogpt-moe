@@ -139,11 +139,11 @@ model = GPT(GPTConfig(
     loss_free_decay=args.loss_free_decay,
     loss_free_strength=args.loss_free_strength,
     loss_free_update_rate=args.loss_free_update_rate,
-    loss_free_bias_rule=args.loss_free_bias_rule,
     router_logit_jitter=args.router_logit_jitter,
     use_router_temperature=args.use_router_temperature,
     diff_topk_reg_max_coeff=args.diff_topk_regularizer_max_coeff,
     diff_topk_reg_fp32=args.diff_topk_regularizer_fp32,
+    theta_load_balance_coeff=args.theta_load_balance_coeff,
 ))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
@@ -314,6 +314,7 @@ for step in range(start_step, args.num_iterations + 1):
         val_loss = 0.0
         val_ce_loss = 0.0
         val_aux_loss = 0.0
+        val_theta_lb_loss = torch.tensor(0.0, device=device)
         val_diff_topk_reg = torch.tensor(0.0, device=device)
         val_router_entropy = torch.tensor(0.0, device=device)
         val_expert_balance = torch.zeros(num_experts, device=device)
@@ -333,6 +334,7 @@ for step in range(start_step, args.num_iterations + 1):
                         ce_loss,
                         total_aux,
                         total_diff_topk_reg,
+                        total_theta_lb,
                         router_entropy,
                         expert_balance,
                         layer_router_entropy,
@@ -349,6 +351,7 @@ for step in range(start_step, args.num_iterations + 1):
                     val_loss += loss.detach()
                     val_ce_loss += ce_loss.detach()
                     val_aux_loss += total_aux.detach()
+                    val_theta_lb_loss = val_theta_lb_loss + total_theta_lb.detach()
                     val_router_entropy = val_router_entropy + router_entropy.detach()
                     val_expert_balance = val_expert_balance + expert_balance.detach()
                     val_layer_router_entropy = val_layer_router_entropy + layer_router_entropy.detach()
@@ -361,10 +364,12 @@ for step in range(start_step, args.num_iterations + 1):
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         dist.all_reduce(val_ce_loss, op=dist.ReduceOp.AVG)
         dist.all_reduce(val_aux_loss, op=dist.ReduceOp.AVG)
+        dist.all_reduce(val_theta_lb_loss, op=dist.ReduceOp.AVG)
         dist.all_reduce(val_diff_topk_reg, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         val_ce_loss /= val_steps
         val_aux_loss /= val_steps
+        val_theta_lb_loss /= val_steps
         val_diff_topk_reg /= val_steps
         # average and all-reduce router stats
         val_router_entropy = val_router_entropy / val_steps
@@ -395,7 +400,7 @@ for step in range(start_step, args.num_iterations + 1):
         model.zero_grad(set_to_none=True)
         gc.collect()
         with ctx:
-            _, loss_ce, ce_loss_probe, total_aux_probe, _, _, _, _, _, _, _ = model(
+            _, loss_ce, ce_loss_probe, total_aux_probe, _, _, _, _, _, _, _, _ = model(
                 x_probe, y_probe, return_logits=False, aux_coeff=0.0, diff_topk_reg_coeff=0.0
             )
         loss_ce.backward()
@@ -413,7 +418,7 @@ for step in range(start_step, args.num_iterations + 1):
         model.zero_grad(set_to_none=True)
         gc.collect()
         with ctx:
-            _, _, _, total_aux_probe, _, _, _, _, _, _, _ = model(
+            _, _, _, total_aux_probe, _, _, _, _, _, _, _, _ = model(
                 x_probe, y_probe, return_logits=False, aux_coeff=0.0, diff_topk_reg_coeff=0.0
             )
         # Backprop aux explicitly
@@ -440,7 +445,7 @@ for step in range(start_step, args.num_iterations + 1):
             with torch.no_grad():
                 with ctx:
                     # Get current expert assignments for tracking sequences
-                    _, _, _, _, _, _, _, _, _, _, _, current_assignments = model(
+                    _, _, _, _, _, _, _, _, _, _, _, _, current_assignments = model(
                         tracking_x,
                         return_logits=False,
                         aux_coeff=0.0,
@@ -486,6 +491,7 @@ for step in range(start_step, args.num_iterations + 1):
                 val_loss,
                 val_ce_loss,
                 val_aux_loss,
+                val_theta_lb_loss,
                 val_diff_topk_reg,
                 val_router_entropy,
                 training_time_ms,
@@ -571,6 +577,7 @@ for step in range(start_step, args.num_iterations + 1):
     layer_router_values_sum = init_layer_router_value_tensors(n_layers, device=device)
     total_router_values_sum = init_total_router_value_tensors(device=device)
     diff_topk_reg_sum = torch.tensor(0.0, device=device)
+    theta_lb_loss_sum = torch.tensor(0.0, device=device)
     for i in range(1, train_accumulation_steps+1):
         if use_global_lb:
             x_batch, y_batch = cached_batches[i-1]
@@ -584,6 +591,7 @@ for step in range(start_step, args.num_iterations + 1):
                 ce_loss,
                 total_aux,
                 total_diff_topk_reg,
+                total_theta_lb,
                 router_entropy,
                 expert_balance,
                 layer_router_entropy,
@@ -600,6 +608,7 @@ for step in range(start_step, args.num_iterations + 1):
             )
             train_loss = loss.detach()
             diff_topk_reg_sum = diff_topk_reg_sum + total_diff_topk_reg.detach()
+            theta_lb_loss_sum = theta_lb_loss_sum + total_theta_lb.detach()
             router_entropy_sum = router_entropy_sum + router_entropy.detach()
             expert_balance_sum = expert_balance_sum + expert_balance.detach()
             layer_router_entropy_sum = layer_router_entropy_sum + layer_router_entropy.detach()
@@ -652,11 +661,13 @@ for step in range(start_step, args.num_iterations + 1):
         key: total_router_values_sum[key] / train_accumulation_steps for key in ROUTER_VALUE_KEYS
     }
     diff_topk_reg_avg = diff_topk_reg_sum / train_accumulation_steps
+    theta_lb_loss_avg = theta_lb_loss_sum / train_accumulation_steps
     dist.all_reduce(router_entropy_avg, op=dist.ReduceOp.AVG)
     dist.all_reduce(expert_balance_avg, op=dist.ReduceOp.AVG)
     dist.all_reduce(layer_router_entropy_avg, op=dist.ReduceOp.AVG)
     dist.all_reduce(layer_expert_balance_avg, op=dist.ReduceOp.AVG)
     dist.all_reduce(diff_topk_reg_avg, op=dist.ReduceOp.AVG)
+    dist.all_reduce(theta_lb_loss_avg, op=dist.ReduceOp.AVG)
     for key in ROUTER_VALUE_KEYS:
         dist.all_reduce(layer_router_values_avg[key], op=dist.ReduceOp.AVG)
         dist.all_reduce(total_router_values_avg[key], op=dist.ReduceOp.AVG)
@@ -672,6 +683,7 @@ for step in range(start_step, args.num_iterations + 1):
             step + 1,
             train_loss,
             diff_topk_reg_avg,
+            theta_lb_loss_avg,
             router_entropy_avg,
             grad_norm,
             approx_time,

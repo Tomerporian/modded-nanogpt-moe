@@ -1,5 +1,5 @@
 job_details:
-  name: smaller_experts
+  name: theta_lb_loss
   output_dir: logs/seeds_and_datasets
 
 parameters:
@@ -44,26 +44,27 @@ parameters:
   device_0: [true]
   seed: [1000, 2000, 3000]
 
-  global_load_balance: [true]
+  global_load_balance: [false]
+  aux_coeff_train: [0.0]
+  aux_coeff_val: [0.0]
 
-  router_type: ['switch', 'diff', 'diff_no_softmax']
-  aux_use_routed_prob: [false, true]
+  router_type: ['switch', 'diff']
 
-  LIST_LB_COEFFS:
-    - aux_coeff_train: [0.1]
-      aux_coeff_val: [0.1]
-    
+  lr_theta: [0.1, 0.5, 1.0]
+  theta_load_balance_coeff: [0.1]
+  theta_lb_detach_theta: [false]
 
   LIST_EXPERT_SIZES:
     - num_experts: [64]
       top_k: [16]
       hidden_dim_scale_factor: [0.5]
-    - num_experts: [128]
-      top_k: [32]
-      hidden_dim_scale_factor: [0.25]
-    # - num_experts: [64]
-    #   top_k: [2]
-    #   hidden_dim_scale_factor: [0.5]
+    - num_experts: [64]
+      top_k: [2]
+      hidden_dim_scale_factor: [0.5]
+
+    # - num_experts: [128]
+    #   top_k: [32]
+    #   hidden_dim_scale_factor: [0.25]
     # - num_experts: [128]
     #   top_k: [4]
     #   hidden_dim_scale_factor: [0.25]

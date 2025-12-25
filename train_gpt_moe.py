@@ -136,7 +136,6 @@ model = GPT(GPTConfig(
     global_load_balance=args.global_load_balance,
     aux_use_routed_prob=args.aux_use_routed_prob,
     loss_free_mode=args.loss_free_mode,
-    loss_free_decay=args.loss_free_decay,
     loss_free_strength=args.loss_free_strength,
     loss_free_update_rate=args.loss_free_update_rate,
     router_logit_jitter=args.router_logit_jitter,

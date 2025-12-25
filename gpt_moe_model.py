@@ -168,7 +168,6 @@ class MoE(nn.Module):
         self.global_load_balance = config.global_load_balance
         self.layer_idx = layer_idx
         self.loss_free_mode = config.loss_free_mode
-        self.loss_free_decay = config.loss_free_decay
         self.loss_free_strength = config.loss_free_strength
         self.loss_free_update_rate = config.loss_free_update_rate
         self.router_logit_jitter = config.router_logit_jitter
@@ -248,14 +247,6 @@ class MoE(nn.Module):
         bias_vec = bias_vec.to(dtype=logits.dtype, device=logits.device)
         view_shape = [1] * (logits.dim() - 1) + [self.num_experts]
         return bias_vec.view(*view_shape)
-
-    def _update_loss_free_state(self, frac_tensor):
-        if not self.loss_free_enabled or not self.training:
-            return
-        with torch.no_grad():
-            decay = self.loss_free_decay
-            update = frac_tensor.detach().to(self.loss_free_ema.dtype)
-            self.loss_free_ema.mul_(decay).add_(update * (1.0 - decay))
 
     def _update_sign_bias(self, frac_tensor):
         if not self.loss_free_enabled or not self.training:
@@ -585,7 +576,6 @@ class GPTConfig:
     global_load_balance : bool = False
     aux_use_routed_prob : bool = False
     loss_free_mode : str = 'none'
-    loss_free_decay : float = 0.99
     loss_free_strength : float = 1.0
     loss_free_update_rate : float = 0.001
     router_logit_jitter : float = 0.0

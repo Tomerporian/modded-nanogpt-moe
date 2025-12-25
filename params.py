@@ -51,8 +51,6 @@ def _build_training_parser():
                        help='compute aux load balancing loss with the probabilities actually used to route tokens')
     group.add_argument('--loss-free-mode', default='none', type=str, choices=['none', 'deepseek', 'stopgrad'],
                        help='loss-free router biasing strategy (deepseek for switch only, stopgrad supports switch/diff)')
-    group.add_argument('--loss-free-decay', default=0.99, type=float,
-                       help='EMA decay for tracking per-layer expert usage in loss-free routing')
     group.add_argument('--loss-free-strength', default=1.0, type=float,
                        help='scale factor applied to the loss-free routing bias')
     group.add_argument('--loss-free-update-rate', default=0.001, type=float,

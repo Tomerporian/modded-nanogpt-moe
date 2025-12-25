@@ -114,6 +114,8 @@ def _build_training_parser():
                        help='number of tokens of validation data')
     group.add_argument('--save-every', default=0, type=int,
                        help='every how many steps to save the checkpoint? 0 for only at the end')
+    group.add_argument('--save-only-latest', action='store_true', default=False,
+                       help='if set, remove the previous checkpoint after saving a new one')
     group.add_argument('--n-tracked-seq', default=100, type=int,
                        help='number of sequences to track for expert assignment changes')
     group.add_argument('--wandb-project', default='modded-nanogpt-moe', type=str,

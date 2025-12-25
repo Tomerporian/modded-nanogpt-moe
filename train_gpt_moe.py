@@ -227,6 +227,12 @@ if args.resume:
     elif args.resume and master_process:
         logging.info(f"Resume requested but checkpoint {args.resume} not found. Starting from scratch.")
 
+last_checkpoint_path = (
+    resolved_resume_path
+    if args.save_only_latest and resolved_resume_path and os.path.isfile(resolved_resume_path)
+    else None
+)
+
 # begin logging
 if master_process:
     run_id = str(uuid.uuid4())
@@ -527,7 +533,16 @@ for step in range(start_step, args.num_iterations + 1):
             schedulers=[sched.state_dict() for sched in schedulers],
             training_time_ms=training_time_ms,
         )
-        torch.save(log, os.path.join(args.output, f'state_step{step:06d}.pt'))
+        checkpoint_path = os.path.join(args.output, f'state_step{step:06d}.pt')
+        torch.save(log, checkpoint_path)
+        if args.save_only_latest and (last_step or args.save_every > 0):
+            previous_checkpoint = last_checkpoint_path
+            last_checkpoint_path = checkpoint_path
+            if previous_checkpoint and previous_checkpoint != checkpoint_path:
+                try:
+                    os.remove(previous_checkpoint)
+                except OSError as err:
+                    logging.warning(f"Failed to remove previous checkpoint {previous_checkpoint}: {err}")
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()

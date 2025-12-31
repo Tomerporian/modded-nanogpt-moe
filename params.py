@@ -149,6 +149,8 @@ def _build_training_parser():
                        help='random seed (default: 42)')
     group.add_argument('--resume', default='auto', type=str,
                        help="checkpoint path to resume from, or 'auto'")
+    group.add_argument('--ops_dtype', default='bfloat16', type=str,
+                       help="dtype for autocast")
 
     return parser
 

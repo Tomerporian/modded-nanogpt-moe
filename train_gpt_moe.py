@@ -36,7 +36,10 @@ from gpt_moe_model import (
     init_total_router_value_tensors,
 )
 
-
+DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
 
 setup_default_logging()
 
@@ -87,8 +90,8 @@ np.random.seed(args.seed + ddp_rank)
 random.seed(args.seed + ddp_rank)
 
 # TODO consider making it more deterministic - but make it slower
-# torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-# torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
+torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 
 # torch.use_deterministic_algorithms(True)
 # torch.backends.cudnn.deterministic = True
@@ -157,14 +160,14 @@ else:
     
 raw_model = model.module # always contains the "raw" unwrapped model
 num_experts = raw_model.transformer.h[0].mlp.num_experts
-ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+ctx = torch.amp.autocast(device_type='cuda', dtype=DTYPES[args.ops_dtype])
 
 # CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
-from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
-enable_cudnn_sdp(True)
-enable_flash_sdp(False)
-enable_mem_efficient_sdp(False)
-enable_math_sdp(False)
+# from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+# enable_cudnn_sdp(True)
+# enable_flash_sdp(True)
+# enable_mem_efficient_sdp(False)
+# enable_math_sdp(False)
 
 # init the optimizer(s)
 optimizers, router_optimizer, router_temperature_optimizer = get_optimizers(raw_model, args)

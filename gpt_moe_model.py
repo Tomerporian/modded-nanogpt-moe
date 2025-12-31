@@ -32,8 +32,8 @@ class Rotary(torch.nn.Module):
             self.seq_len_cached = seq_len
             t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
             freqs = torch.outer(t, self.inv_freq).to(x.device)
-            self.cos_cached = freqs.cos().bfloat16()
-            self.sin_cached = freqs.sin().bfloat16()
+            self.cos_cached = freqs.cos() #.bfloat16()
+            self.sin_cached = freqs.sin() #.bfloat16()
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
 
     @staticmethod

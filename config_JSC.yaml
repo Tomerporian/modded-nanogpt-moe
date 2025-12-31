@@ -1,5 +1,5 @@
 job_details:
-  name: more_extreme_theta_lb_loss_values
+  name: fp32_aux_loss
   output_dir: logs/seeds_and_datasets
 
 parameters:
@@ -45,23 +45,24 @@ parameters:
   device_0: [true]
   seed: [1000]
 
-  global_load_balance: [false]
-  aux_coeff_train: [0.0]
-  aux_coeff_val: [0.0]
+  global_load_balance: [true]
+  aux_coeff_train: [0.1]
+  aux_coeff_val: [0.1]
 
   router_type: ['switch', 'diff', 'diff_no_softmax']
+  ops_dtype: ['float32']
 
-  lr_theta: [0.001, 0.01, 5.0]
-  theta_load_balance_coeff: [0.1]
-  theta_lb_detach_theta: [false]
+  # lr_theta: [0.001, 0.01, 5.0]
+  # theta_load_balance_coeff: [0.1]
+  # theta_lb_detach_theta: [false]
 
   LIST_EXPERT_SIZES:
     - num_experts: [64]
       top_k: [16]
       hidden_dim_scale_factor: [0.5]
-    - num_experts: [64]
-      top_k: [2]
-      hidden_dim_scale_factor: [0.5]
+    # - num_experts: [64]
+    #   top_k: [2]
+    #   hidden_dim_scale_factor: [0.5]
 
     # - num_experts: [128]
     #   top_k: [32]

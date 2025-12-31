@@ -1,5 +1,5 @@
 job_details:
-  name: diff_no_softmax_theta_lb
+  name: diff_no_softmax_constant_lr_sweep
   output_dir: logs/seeds_and_datasets
 
 parameters:
@@ -22,15 +22,16 @@ parameters:
   batch_size: [512]  # 8*64
   device_batch_size: [8]  # was 16
   sequence_length: [1024]
-  num_iterations: [6000] # was 4578 before
+  # num_iterations: [6000] # was 4578 before
+  num_iterations: [4286]  # 6000 - 1714
   warmup_iters: [0]
-  warmdown_iters: [1714] # was 1308 before
+  # warmdown_iters: [1714] # was 1308 before
   weight_decay: [0.0]
   use_adamw_opt3: [false]
   # Learning rate parameters
   lr_embed: [0.3]
   lr_head: [0.002]
-  lr_muon: [0.02]
+  # lr_muon: [0.02]
   momentum: [0.95]
 
   # Evaluation and logging parameters
@@ -45,23 +46,25 @@ parameters:
   device_0: [true]
   seed: [1000]
 
-  global_load_balance: [false]
-  aux_coeff_train: [0.0]
-  aux_coeff_val: [0.0]
+  global_load_balance: [true]
+  aux_coeff_train: [0.1]
+  aux_coeff_val: [0.1]
 
   router_type: ['diff_no_softmax']
+  warmdown_iters: [0]
+  lr_muon: [0.002, 0.0063, 0.02, 0.063, 0.2]
 
-  lr_theta: [0.1, 0.5]
-  theta_load_balance_coeff: [0.1]
-  theta_lb_detach_theta: [false]
+  # lr_theta: [0.001, 0.01, 5.0]
+  # theta_load_balance_coeff: [0.1]
+  # theta_lb_detach_theta: [false]
 
   LIST_EXPERT_SIZES:
     - num_experts: [64]
       top_k: [16]
       hidden_dim_scale_factor: [0.5]
-    - num_experts: [64]
-      top_k: [2]
-      hidden_dim_scale_factor: [0.5]
+    # - num_experts: [64]
+    #   top_k: [2]
+    #   hidden_dim_scale_factor: [0.5]
 
     # - num_experts: [128]
     #   top_k: [32]

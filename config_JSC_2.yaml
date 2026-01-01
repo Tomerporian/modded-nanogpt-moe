@@ -1,5 +1,5 @@
 job_details:
-  name: diff_no_softmax_constant_lr_sweep
+  name: diff_no_softmax_constant_lr_sweep_routed_probs_true
   output_dir: logs/seeds_and_datasets
 
 parameters:
@@ -49,6 +49,7 @@ parameters:
   global_load_balance: [true]
   aux_coeff_train: [0.1]
   aux_coeff_val: [0.1]
+  aux_use_routed_prob: [true]
 
   router_type: ['diff_no_softmax']
   warmdown_iters: [0]

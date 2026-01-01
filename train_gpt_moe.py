@@ -725,6 +725,8 @@ if master_process:
         wandb.finish()
     except Exception:
         pass
+    with open(os.path.join(args.output, 'done'), 'w') as f:
+        f.write('')
 
 # -------------------------------------------------------------------------
 # clean up nice

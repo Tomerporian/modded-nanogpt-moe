@@ -1,5 +1,5 @@
 job_details:
-  name: fp32_aux_loss
+  name: fp32_aux_loss_routed_probs_true
   output_dir: logs/seeds_and_datasets
 
 parameters:
@@ -49,7 +49,8 @@ parameters:
   aux_coeff_train: [0.1]
   aux_coeff_val: [0.1]
 
-  router_type: ['switch', 'diff', 'diff_no_softmax']
+  router_type: ['diff', 'diff_no_softmax']
+  aux_use_routed_prob: [true]
   ops_dtype: ['float32']
 
   # lr_theta: [0.001, 0.01, 5.0]

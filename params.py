@@ -39,7 +39,7 @@ def _build_training_parser():
                        help='number of MoE experts')
     group.add_argument('--top-k', default=2, type=int,
                        help='top-k experts to use')
-    group.add_argument('--router-type', default='diff', type=str, choices=['switch', 'diff', 'diff_no_softmax', 'hash'],
+    group.add_argument('--router-type', default='diff', type=str, choices=['switch', 'diff', 'diff_no_softmax', 'hash', 'scaled_diff_no_softmax'],
                        help='router type for MoE')
     group.add_argument('--router-depth', default=1, type=int,
                        help='number of layers in the router MLP for non-hash routing (hidden dim == input dim)')

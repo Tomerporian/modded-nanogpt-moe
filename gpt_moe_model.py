@@ -14,6 +14,8 @@ ROUTER_VALUE_KEYS = (
     'top1_coef',
     'top2_coef',
     'coef_diff',
+    'max_scaler',
+    'min_scaler'
 )
 
 
@@ -143,6 +145,18 @@ def diff_no_softmax(logits, k):
     return topk_idx, topk_weights, gate
 
 
+def scaled_diff_no_softmax(logits, k, scalers):
+    exp_scalers = torch.exp(scalers)
+    num_experts = logits.shape[-1]
+    kth_smallest_idx = num_experts - k
+    m = torch.kthvalue(logits, k=kth_smallest_idx, dim=-1, keepdim=True).values
+    topk = F.relu(logits - m)
+    scaled_topk = exp_scalers * topk
+    topk_weights = scaled_topk / (scaled_topk.sum(dim=-1, keepdim=True) + 1e-8)
+    gate, topk_idx = torch.topk(topk_weights, k, dim=-1)
+    return topk_idx, topk_weights, gate
+
+
 def init_layer_router_value_tensors(n_layers, device):
     return {key: torch.zeros(n_layers, device=device, dtype=torch.float32) for key in ROUTER_VALUE_KEYS}
 
@@ -186,7 +200,7 @@ class MoE(nn.Module):
         else:
             self.register_parameter('load_balance_theta', None)
 
-        assert self.router_type in ('hash', 'switch', 'diff', 'diff_no_softmax')
+        assert self.router_type in ('hash', 'switch', 'diff', 'diff_no_softmax', 'scaled_diff_no_softmax')
         assert self.router_activation in ('gelu', 'relu', 'relu_squared')
         assert self.loss_free_mode in ('none', 'deepseek', 'stopgrad')
         assert self.router_logit_jitter >= 0.0, "router_logit_jitter must be non-negative"
@@ -211,6 +225,11 @@ class MoE(nn.Module):
             self.router = nn.Sequential(*layers)
         else:
             self.router = None
+        
+        if self.router_type == 'scaled_diff_no_softmax':
+            self.router_scaler = nn.Linear(config.n_embd, self.num_experts, bias=False)
+            with torch.no_grad():
+                self.router_scaler.weight.zero_()
 
     def _get_router_temperature(self, reference_tensor):
         if not self.use_router_temperature or self.router_temperature_log is None:
@@ -414,6 +433,10 @@ class MoE(nn.Module):
         elif self.router_type == "diff_no_softmax":
             topk_idx, routed_probs_for_aux, gate = diff_no_softmax(logits_for_selection, self.top_k)
             probs = logits.softmax(dim=-1)
+        elif self.router_type == 'scaled_diff_no_softmax':
+            scalers = self.router_scaler(x)
+            topk_idx, routed_probs_for_aux, gate = scaled_diff_no_softmax(logits_for_selection, self.top_k, scalers)
+            probs = logits.softmax(dim=-1)
         else:
             raise ValueError(f"unknown routing type: {self.router_type}")
         
@@ -459,7 +482,14 @@ class MoE(nn.Module):
                 'top1_coef': top1_coef_vals.mean(),
                 'top2_coef': top2_coef_vals.mean(),
                 'coef_diff': (top1_coef_vals - top2_coef_vals).mean(),
+                'max_scaler': 0,
+                'min_scaler': 0
             }
+            
+            if self.router_type == 'scaled_diff_no_softmax':
+                exp_scalers = torch.exp(scalers)
+                router_value_stats['max_scaler'] = exp_scalers.max()
+                router_value_stats['min_scaler'] = exp_scalers.min()
 
         diff_topk_reg = self._compute_diff_topk_regularizer(logits_for_selection)
 

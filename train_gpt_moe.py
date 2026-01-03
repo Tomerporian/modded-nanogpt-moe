@@ -178,7 +178,7 @@ def get_lr(it):
     if it < args.warmup_iters:
         return (it+1) / args.warmup_iters
     # 2) constant lr for a while
-    elif it < args.num_iterations - args.warmdown_iters:
+    elif it <= args.num_iterations - args.warmdown_iters:
         return 1.0
     # 3) linear warmdown
     else:

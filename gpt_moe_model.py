@@ -482,8 +482,8 @@ class MoE(nn.Module):
                 'top1_coef': top1_coef_vals.mean(),
                 'top2_coef': top2_coef_vals.mean(),
                 'coef_diff': (top1_coef_vals - top2_coef_vals).mean(),
-                'max_scaler': 0,
-                'min_scaler': 0
+                'max_scaler': torch.tensor(0, dtype=torch.float, device=x.device),
+                'min_scaler': torch.tensor(0, dtype=torch.float, device=x.device)
             }
             
             if self.router_type == 'scaled_diff_no_softmax':

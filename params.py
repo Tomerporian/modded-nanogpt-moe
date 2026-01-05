@@ -140,6 +140,8 @@ def _build_training_parser():
                        help='coefficient for the theta-based load balancing loss during training')
     group.add_argument('--theta-lb-detach-theta', type=_str2bool, default=True,
                        help='if true, detach theta before adding it to router logits')
+    group.add_argument('--theta-lb-detach-logits', type=_str2bool, default=True,
+                       help='if true, detach logits before theta_lb_loss')
 
     # Misc parameters
     group = parser.add_argument_group('Run config')

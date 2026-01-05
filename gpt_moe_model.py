@@ -188,9 +188,10 @@ class MoE(nn.Module):
         self.use_router_temperature = config.use_router_temperature
         self.aux_use_routed_prob = config.aux_use_routed_prob
         self.diff_topk_reg_fp32 = config.diff_topk_reg_fp32
-        self.diff_topk_reg_enabled = self.router_type == 'diff' and config.diff_topk_reg_max_coeff > 0.0
+        self.diff_topk_reg_enabled = config.diff_topk_reg_max_coeff > 0.0
         self.theta_load_balance_coeff = config.theta_load_balance_coeff
         self.theta_lb_detach_theta = config.theta_lb_detach_theta
+        self.theta_lb_detach_logits = config.theta_lb_detach_logits
         if self.use_router_temperature:
             self.router_temperature_log = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         else:
@@ -327,17 +328,19 @@ class MoE(nn.Module):
         num_experts = logits.size(-1)
 
         # Detach router logits so gradients flow only into theta.
-        # logits_detached = logits.reshape(-1, num_experts).float()
-        logits_detached = logits.detach().reshape(-1, num_experts).float()
-        token_count = logits_detached.shape[0]
-        x_tilde = logits_detached + self.load_balance_theta
+        logits_detached = logits.detach() if self.theta_lb_detach_logits else logits
+        reshaped_logits = logits_detached.reshape(-1, num_experts).float()
+        
+        x_tilde = reshaped_logits + self.load_balance_theta
         kth_smallest_idx = num_experts - self.top_k
         m_xt = torch.kthvalue(x_tilde, k=kth_smallest_idx, dim=1).values.unsqueeze(1)
         at_top = torch.relu(x_tilde - m_xt)
         at_bottom = torch.relu(m_xt - x_tilde)
         scale = (num_experts - self.top_k) / self.top_k
         balanced = at_top * scale + at_bottom
-        return balanced.sum() / float(token_count)
+        
+        norm_factor = reshaped_logits.shape[0] * num_experts
+        return balanced.sum() / float(norm_factor)
 
     def finalize_loss_free_update(self):
         if not self.loss_free_enabled:
@@ -614,6 +617,7 @@ class GPTConfig:
     diff_topk_reg_fp32 : bool = False
     theta_load_balance_coeff : float = 0.0
     theta_lb_detach_theta : bool = True
+    theta_lb_detach_logits : bool = True
 
 
 class GPT(nn.Module):

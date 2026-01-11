@@ -105,6 +105,10 @@ def _build_training_parser():
                        help='learning rate for theta load balance parameters')
     group.add_argument('--momentum', default=0.95, type=float,
                        help='momentum for muon optimizer')
+    group.add_argument('--lr-scheduler', default='linear', type=str,
+                       help='LR decay scheduler type', choices=['linear', 'inverse'])
+    group.add_argument('--min-lr', default=0.1, type=float,
+                    help='Min LR value after decay. Works only for inverse')
 
     # Evaluation and logging parameters
     group = parser.add_argument_group('Evaluation and logging parameters')

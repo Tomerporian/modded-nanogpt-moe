@@ -11,6 +11,7 @@ import logging
 import warnings
 import random
 import re
+import shutil
 
 import numpy as np
 import torch
@@ -26,6 +27,7 @@ import wandb
 from wandb_logging import init_wandb, wandb_train_log, wandb_val_log
 from params import parse_args
 from optimizers import get_optimizers
+from schedulers import SCHEDULER_TYPE
 from logger import setup_default_logging
 from data.dataloaders import create_dataloader
 from gpt_moe_model import (
@@ -172,20 +174,10 @@ ctx = torch.amp.autocast(device_type='cuda', dtype=DTYPES[args.ops_dtype])
 
 # init the optimizer(s)
 optimizers, router_optimizer, router_temperature_optimizer = get_optimizers(raw_model, args)
-# learning rate decay scheduler (linear warmup and warmdown)
-def get_lr(it):
-    assert it <= args.num_iterations
-    # 1) linear warmup for warmup_iters steps
-    if it < args.warmup_iters:
-        return (it+1) / args.warmup_iters
-    # 2) constant lr for a while
-    elif it <= args.num_iterations - args.warmdown_iters:
-        return 1.0
-    # 3) linear warmdown
-    else:
-        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
-        return decay_ratio
-schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+
+# init the scheduler(s)
+scheduler_type = SCHEDULER_TYPE[args.lr_scheduler]
+schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, lambda it: scheduler_type(args, it, min_lr=args.min_lr)) for opt in optimizers]
 
 def get_diff_topk_reg_coeff(step):
     max_coeff = args.diff_topk_regularizer_max_coeff
@@ -226,10 +218,16 @@ if args.resume:
         start_step = min(start_step, args.num_iterations)
         resume_training_time_ms = checkpoint.get('training_time_ms', 0.0)
         args.resume = resolved_resume_path
-        if master_process:
+
+        if os.path.dirname(resolved_resume_path) != args.output:
+            new_resume_path = os.path.join(args.output, os.path.basename(resolved_resume_path))
+            if master_process:
+                shutil.copyfile(resolved_resume_path, new_resume_path)
+            resolved_resume_path = new_resume_path
+                
             logging.info(f"Resumed from checkpoint {resolved_resume_path} at step {start_step}.")
-    elif args.resume and master_process:
-        logging.info(f"Resume requested but checkpoint {args.resume} not found. Starting from scratch.")
+    elif args.resume and args.resume != 'auto' and master_process:
+        raise ValueError(f"Resume requested but checkpoint {args.resume} not found")
 
 last_checkpoint_path = (
     resolved_resume_path

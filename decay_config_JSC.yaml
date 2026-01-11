@@ -1,0 +1,71 @@
+job_details:
+  name: decay_diff_no_softmax_lr_muo=0.02
+  output_dir: logs/seeds_and_datasets
+
+parameters:
+  LIST_DATASETS:
+    # - input_bin: ["data/fineweb10B/fineweb_train_*.bin"]
+    #   input_val_bin: ["data/fineweb10B/fineweb_train_*.bin"]
+    # - input_bin: ["data/tokenized_owt2/train.bin"]
+    #   input_val_bin: ["data/tokenized_owt2/val.bin"]
+    - input_bin: ["/p/data1/mmlaion/text-data/tokenized/c4/merged"]
+      input_val_bin: ["/p/data1/mmlaion/text-data/tokenized/c4/merged"]
+
+  # Model parameters
+  vocab_size: [50304]
+  n_layer: [12]
+  n_head: [6] # change to 12?
+  n_embd: [768]
+
+  # Optimization parameters
+  batch_size: [512]  # 8*64
+  device_batch_size: [8]  # was 16
+  sequence_length: [1024]
+  weight_decay: [0.0]
+  use_adamw_opt3: [false]
+  # Learning rate parameters
+  lr_embed: [0.3]
+  lr_head: [0.002]
+  lr_muon: [0.02]
+  momentum: [0.95]
+
+  # Evaluation and logging parameters
+  val_loss_every: [125]
+  val_tokens: [10485760]
+  save_every: [200]
+  save_only_latest: [true]
+  wandb_project: ["modded-nanogpt-moe"]
+  output: ["logs"]
+
+  # Run config
+  device_0: [true]
+  seed: [1000]
+
+  global_load_balance: [true]
+  aux_coeff_train: [0.1]
+  aux_coeff_val: [0.1]
+  num_experts: [64]
+  top_k: [16]
+  hidden_dim_scale_factor: [0.5]
+    
+  # resume params
+  num_iterations: [6000]  # was 4286. 
+  warmup_iters: [0]
+  warmdown_iters: [1714]  #=  6000 - 4286
+  resume: ['/p/home/jusers/porian1/juwels/porian1/modded-nanogpt-moe/logs/seeds_and_datasets/26-01-01-diff_no_softmax_constant_lr_sweep_routed_probs_true/002_26-01-01-diff_no_softmax_constant_lr_sweep_routed_probs_true+lr_muo=0.02/state_step004200.pt']
+  
+  LIST_ROUTERS:
+    - router_type: ['diff_no_softmax']
+      aux_use_routed_prob: [true]
+    - router_type: ['diff']
+      aux_use_routed_prob: [true]
+    - router_type: ['switch']
+      aux_use_routed_prob: [false]
+  
+  LIST_SCHEDULERS:
+    - lr_scheduler: ['inverse']
+      min_lr: [0.1, 0.01]
+    - lr_scheduler: ['linear']
+      min_lr: [0.1]
+  
+  

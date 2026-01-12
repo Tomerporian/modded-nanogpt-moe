@@ -1,5 +1,5 @@
 job_details:
-  name: scaled_diff_no_softmax
+  name: router_glu_variants
   output_dir: logs/seeds_and_datasets
 
 parameters:
@@ -49,9 +49,13 @@ parameters:
   aux_coeff_train: [0.1]
   aux_coeff_val: [0.1]
 
-  router_type: ['scaled_diff_no_softmax']
-  aux_use_routed_prob: [true]
-  # ops_dtype: ['float32']
+  LIST_ROUTER_TYPES:
+    - router_type: ['diff_no_softmax']
+      aux_use_routed_prob: [true]
+    - router_type: ['switch']
+      aux_use_routed_prob: [false]
+  
+  router_layer_type: ['swiglu', 'geglu', 'reglu']
 
   # lr_theta: [0.001, 0.01, 5.0]
   # theta_load_balance_coeff: [0.1]

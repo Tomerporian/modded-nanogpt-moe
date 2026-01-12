@@ -77,6 +77,8 @@ def _build_training_parser():
                        help='number of warmup iterations')
     group.add_argument('--warmdown-iters', default=1308, type=int,
                        help='iterations of linear warmup/warmdown for triangular or trapezoidal schedule')
+    group.add_argument('--triangle-up-iters', default=0, type=int,
+                       help='number of triangle up iterations. for changing router exps')
     group.add_argument('--weight-decay', default=0.0, type=float,
                        help='weight decay')
     group.add_argument('--adamw-betas', nargs=2, type=float, default=(0.9, 0.95), metavar=('BETA1', 'BETA2'),

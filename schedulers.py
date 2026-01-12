@@ -34,7 +34,30 @@ def get_inverse_decay_lr(args, it, lr=1, min_lr=0.1):
         
         return 1 / inv
     
+    
+def get_triangle_resume_lr(args, it, lr=None, min_lr=None):
+    assert it <= args.num_iterations
+
+    new_max_lr_factor = min_lr
+    
+    # 1) linear warmup for warmup_iters steps
+    if it < args.warmup_iters:
+        return (it+1) / args.warmup_iters
+    # 2) constant lr for a while
+    elif it <= args.num_iterations - args.warmdown_iters - args.triangle_up_iterations:
+        return 1.0
+    elif it <= args.num_iterations - args.warmdown_iters:
+        inside_it = it - args.num_iterations + args.warmdown_iters + args.triangle_up_iterations
+        return 1.0 + (new_max_lr_factor) * (inside_it) / (args.triangle_up_iterations)
+    # 3) linear warmdown
+    else:
+        decay_ratio = (new_max_lr_factor + 1) * (args.num_iterations - it) / args.warmdown_iters
+        return decay_ratio
+
+
+    
 SCHEDULER_TYPE = {
     'linear': get_constant_lr,
-    'inverse': get_inverse_decay_lr
+    'inverse': get_inverse_decay_lr,
+    'triangle_resume': get_triangle_resume_lr
 }

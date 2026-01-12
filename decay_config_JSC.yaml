@@ -1,5 +1,5 @@
 job_details:
-  name: decay_diff_no_softmax_lr_muo=0.02
+  name: decay_+500_iters
   output_dir: logs/seeds_and_datasets
 
 parameters:
@@ -26,7 +26,7 @@ parameters:
   # Learning rate parameters
   lr_embed: [0.3]
   lr_head: [0.002]
-  lr_muon: [0.02]
+  # lr_muon: [0.02]
   momentum: [0.95]
 
   # Evaluation and logging parameters
@@ -49,23 +49,33 @@ parameters:
   hidden_dim_scale_factor: [0.5]
     
   # resume params
-  num_iterations: [6000]  # was 4286. 
+  num_iterations: [6500]  # was 4286. 
   warmup_iters: [0]
   warmdown_iters: [1714]  #=  6000 - 4286
   resume: ['/p/home/jusers/porian1/juwels/porian1/modded-nanogpt-moe/logs/seeds_and_datasets/26-01-01-diff_no_softmax_constant_lr_sweep_routed_probs_true/002_26-01-01-diff_no_softmax_constant_lr_sweep_routed_probs_true+lr_muo=0.02/state_step004200.pt']
   
+  
   LIST_ROUTERS:
     - router_type: ['diff_no_softmax']
       aux_use_routed_prob: [true]
-    - router_type: ['diff']
-      aux_use_routed_prob: [true]
+      lr_muon: [0.02]
+      triangle_up_iterations: [0]
+      min_lr: [0.1]
+      lr_scheduler: ['linear']
     - router_type: ['switch']
       aux_use_routed_prob: [false]
-  
-  LIST_SCHEDULERS:
-    - lr_scheduler: ['inverse']
-      min_lr: [0.1, 0.01]
-    - lr_scheduler: ['linear']
+      lr_muon: [0.2, 0.01, 0.02]
+      triangle_up_iterations: [0]
       min_lr: [0.1]
+      lr_scheduler: ['linear']
+    - router_type: ['switch']
+      aux_use_routed_prob: [false]
+      lr_muon: [0.02]
+      triangle_up_iterations: [500]
+      min_lr: [0.1, 1, 10]
+      lr_scheduler: ['triangle_resume']
+  
+  
+      
   
   

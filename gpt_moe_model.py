@@ -169,6 +169,29 @@ class ReLUSquared(nn.Module):
     def forward(self, x):
         return torch.relu(x).square()
 
+class GLUVariant(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, variant):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.variant = variant
+
+        act_dict = {
+            'swiglu': F.silu,
+            'geglu': F.gelu,
+            'reglu': F.relu
+        }
+        
+        self.w_act = nn.Linear(self.input_dim, self.hidden_dim, bias=False)
+        self.w_lin = nn.Linear(self.input_dim, self.hidden_dim, bias=False)
+        self.w_out = nn.Linear(self.hidden_dim, self.output_dim, bias=False)
+        self.act = act_dict[variant]
+    
+    def forward(self, x):
+        act = self.act(self.w_act(x))
+        lin = self.w_lin(x)
+        return self.w_out(act * lin)
 
 class MoE(nn.Module):
     def __init__(self, config, layer_idx=0):
@@ -178,6 +201,7 @@ class MoE(nn.Module):
         assert 1 <= self.top_k <= self.num_experts, "`k` must be in [1, #experts]"
         self.router_type = config.router_type
         self.router_depth = config.router_depth
+        self.router_layer_type = config.router_layer_type
         self.router_activation = config.router_activation
         self.global_load_balance = config.global_load_balance
         self.layer_idx = layer_idx
@@ -218,12 +242,21 @@ class MoE(nn.Module):
         self.loss_free_override_frac = None
         
         if self.router_type != 'hash':
-            layers = []
-            for _ in range(self.router_depth - 1):
-                layers.append(nn.Linear(config.n_embd, config.n_embd, bias=False))
-                layers.append(self._build_router_activation())
-            layers.append(nn.Linear(config.n_embd, self.num_experts, bias=False))
-            self.router = nn.Sequential(*layers)
+            if self.router_layer_type is None or self.router_layer_type == 'linear':
+                layers = []
+                for _ in range(self.router_depth - 1):
+                    layers.append(nn.Linear(config.n_embd, config.n_embd, bias=False))
+                    layers.append(self._build_router_activation())
+                layers.append(nn.Linear(config.n_embd, self.num_experts, bias=False))
+                self.router = nn.Sequential(*layers)
+            else:
+                router_hidden_dim = self.num_experts
+                self.router = nn.Sequential(GLUVariant(
+                    input_dim=config.n_embd, 
+                    hidden_dim=router_hidden_dim,
+                    output_dim=self.num_experts,
+                    variant=self.router_layer_type))
+                
         else:
             self.router = None
         
@@ -605,6 +638,7 @@ class GPTConfig:
     top_k : int = 2
     router_type : str = 'diff'
     router_depth : int = 1
+    router_layer_type : str = None
     router_activation : str = 'gelu'
     global_load_balance : bool = False
     aux_use_routed_prob : bool = False

@@ -36,6 +36,7 @@ from gpt_moe_model import (
     ROUTER_VALUE_KEYS,
     init_layer_router_value_tensors,
     init_total_router_value_tensors,
+    GLUVariant
 )
 
 DTYPES = {
@@ -137,6 +138,7 @@ model = GPT(GPTConfig(
     top_k=args.top_k,
     router_type=args.router_type,
     router_depth=args.router_depth,
+    router_layer_type=args.router_layer_type,
     router_activation=args.router_activation,
     global_load_balance=args.global_load_balance,
     aux_use_routed_prob=args.aux_use_routed_prob,
@@ -415,8 +417,12 @@ for step in range(start_step, args.num_iterations + 1):
         ce_router_layer_grad_norms = []
         for li in range(raw_model.config.n_layer):
             if raw_model.transformer.h[li].mlp.router_type != 'hash':
-                p = raw_model.transformer.h[li].mlp.router[-1].weight
-                gnorm = p.grad.detach().float().norm(2) if p.grad is not None else torch.tensor(0.0, device=device)
+                l = raw_model.transformer.h[li].mlp.router[-1]
+                if isinstance(l, GLUVariant):
+                    gnorm = l.w_out.weight.grad.detach().float().norm(2) if l.w_out.weight.grad is not None else torch.tensor(0.0, device=device)
+                else:
+                    gnorm = l.weight.grad.detach().float().norm(2) if l.weight.grad is not None else torch.tensor(0.0, device=device)
+
                 ce_router_layer_grad_norms.append(gnorm)
             else:
                 ce_router_layer_grad_norms.append(torch.tensor(0.0, device=device))
@@ -434,8 +440,11 @@ for step in range(start_step, args.num_iterations + 1):
         aux_router_layer_grad_norms = []
         for li in range(raw_model.config.n_layer):
             if raw_model.transformer.h[li].mlp.router_type != 'hash':
-                p = raw_model.transformer.h[li].mlp.router[-1].weight
-                gnorm = p.grad.detach().float().norm(2) if p.grad is not None else torch.tensor(0.0, device=device)
+                l = raw_model.transformer.h[li].mlp.router[-1]
+                if isinstance(l, GLUVariant):
+                    gnorm = l.w_out.weight.grad.detach().float().norm(2) if l.w_out.weight.grad is not None else torch.tensor(0.0, device=device)
+                else:
+                    gnorm = l.weight.grad.detach().float().norm(2) if l.weight.grad is not None else torch.tensor(0.0, device=device)
                 aux_router_layer_grad_norms.append(gnorm)
             else:
                 aux_router_layer_grad_norms.append(torch.tensor(0.0, device=device))

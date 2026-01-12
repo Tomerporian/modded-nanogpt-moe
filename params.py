@@ -43,6 +43,9 @@ def _build_training_parser():
                        help='router type for MoE')
     group.add_argument('--router-depth', default=1, type=int,
                        help='number of layers in the router MLP for non-hash routing (hidden dim == input dim)')
+    group.add_argument('--router-layer-type', default=None, type=str,
+                       help='Router layer type. None means linear for bw compatabilty ',
+                       choices=['swiglu','geglu', 'reglu'])
     group.add_argument('--router-activation', default='gelu', type=str, choices=['gelu', 'relu', 'relu_squared'],
                        help='activation to use between router MLP layers (if depth > 1)')
     group.add_argument('--global-load-balance', action='store_true', default=False,

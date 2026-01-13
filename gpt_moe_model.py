@@ -144,6 +144,18 @@ def diff_no_softmax(logits, k):
     gate, topk_idx = torch.topk(topk_weights, k, dim=-1)
     return topk_idx, topk_weights, gate
 
+def diff_no_softmax_to_switch_transistion(logits, k, diff_weight, null_expert_bias=0.0, weight_logits=None, probs_override=None):
+    if diff_weight == 0:
+        return switch_topk(logits, k, null_expert_bias=null_expert_bias, weight_logits=weight_logits, probs_override=probs_override)
+    if diff_weight == 1:
+        return diff_no_softmax(logits, k)
+
+    topk_idx, switch_routed_probs, switch_gate = switch_topk(logits, k, null_expert_bias=null_expert_bias, weight_logits=weight_logits, probs_override=probs_override)
+    topk_idx, diff_routed_probs, diff_gate = diff_no_softmax(logits, k)
+    routed_probs = diff_weight * diff_routed_probs + (1 - diff_weight) * switch_routed_probs
+    gate = diff_weight * diff_gate + (1 - diff_weight) * switch_gate
+    return topk_idx, routed_probs, gate
+
 
 def scaled_diff_no_softmax(logits, k, scalers):
     exp_scalers = torch.exp(scalers)
@@ -417,7 +429,7 @@ class MoE(nn.Module):
         y = y_flat.view_as(x)
         return y, None, None, None, None, None, None
 
-    def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None):
+    def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None, diff_weight=1):
         if self.router_type == "hash":
             return self.run_hash_routing(token_idx, x)
 
@@ -467,7 +479,9 @@ class MoE(nn.Module):
             topk_idx, routed_probs_for_aux, gate = diff_routing(logits_for_selection, self.top_k)
             probs = logits.softmax(dim=-1)
         elif self.router_type == "diff_no_softmax":
-            topk_idx, routed_probs_for_aux, gate = diff_no_softmax(logits_for_selection, self.top_k)
+            # topk_idx, routed_probs_for_aux, gate = diff_no_softmax(logits_for_selection, self.top_k)
+            topk_idx, routed_probs_for_aux, gate = diff_no_softmax_to_switch_transistion(
+                logits_for_selection, self.top_k, diff_weight=diff_weight)
             probs = logits.softmax(dim=-1)
         elif self.router_type == 'scaled_diff_no_softmax':
             scalers = self.router_scaler(x)
@@ -593,7 +607,7 @@ class Block(nn.Module):
             layer_idx=layer_idx,
         )
 
-    def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None):
+    def forward(self, x, token_idx=None, return_expert_assignments=False, router_context=None, diff_weight=1):
         x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
         if return_expert_assignments:
             (
@@ -606,7 +620,7 @@ class Block(nn.Module):
                 theta_lb_loss,
                 expert_assignments,
             ) = self.mlp(
-                F.rms_norm(x, (x.size(-1),)), token_idx, return_expert_assignments=True, router_context=router_context
+                F.rms_norm(x, (x.size(-1),)), token_idx, return_expert_assignments=True, router_context=router_context, diff_weight=diff_weight
             )
             x = x + mlp_out
             return (
@@ -621,7 +635,7 @@ class Block(nn.Module):
             )
         else:
             mlp_out, aux, router_entropy, expert_balance, router_value_stats, diff_topk_reg, theta_lb_loss = self.mlp(
-                F.rms_norm(x, (x.size(-1),)), token_idx, router_context=router_context
+                F.rms_norm(x, (x.size(-1),)), token_idx, router_context=router_context, diff_weight=diff_weight
             )
             x = x + mlp_out
             return x, aux, router_entropy, expert_balance, router_value_stats, diff_topk_reg, theta_lb_loss
@@ -678,6 +692,7 @@ class GPT(nn.Module):
         diff_topk_reg_coeff=0.0,
         return_expert_assignments=False,
         router_context=None,
+        diff_weight=1,
     ):
 
         # forward the GPT model itself
@@ -704,7 +719,7 @@ class GPT(nn.Module):
                     theta_lb_loss,
                     expert_assignments,
                 ) = block(
-                    x, idx, return_expert_assignments=True, router_context=router_context
+                    x, idx, return_expert_assignments=True, router_context=router_context, diff_weight=diff_weight
                 )
                 all_layer_expert_assignments.append(expert_assignments)
             else:
@@ -717,7 +732,7 @@ class GPT(nn.Module):
                     diff_topk_reg,
                     theta_lb_loss,
                 ) = block(
-                    x, idx, router_context=router_context
+                    x, idx, router_context=router_context, diff_weight=diff_weight
                 )
             total_aux = total_aux + aux
             total_diff_topk_reg = total_diff_topk_reg + diff_topk_reg

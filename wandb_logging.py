@@ -169,6 +169,7 @@ def wandb_val_log(
     topk_change_percentages,
     any_topk_changed_percentages,
     router_value_keys,
+    diff_weight,
 ):
     def _to_float(value):
         return float(value.item() if isinstance(value, torch.Tensor) else value)
@@ -194,6 +195,7 @@ def wandb_val_log(
         'val/router_entropy': float(val_router_entropy.item()),
         'train/time_ms': float(training_time_ms),
         'train/step_avg_ms': float(training_time_ms / max(timed_steps - 1, 1)),
+        'transition/diff_weight': diff_weight,
     })
     log.update(log_max_vio(val_layer_expert_balance, 'val/MaxVioglobal', 'val/MaxVioglobal'))
     log.update(log_entropy(val_layer_router_entropy))

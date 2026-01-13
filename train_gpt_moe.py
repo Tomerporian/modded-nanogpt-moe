@@ -313,6 +313,13 @@ for step in range(start_step, args.num_iterations + 1):
         t0 = time.time()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
     diff_topk_reg_coeff = get_diff_topk_reg_coeff(step)
+    if args.transition_start_iter == -1 or step < args.transition_start_iter:
+        diff_weight = 1
+    elif step > args.transition_end_iter:
+        diff_weight = 0
+    else:
+        transition_duration = args.transition_end_iter - args.transition_start_iter
+        diff_weight = (args.transition_end_iter - step) / transition_duration
 
     # once in a while evaluate the validation dataset
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
@@ -357,6 +364,7 @@ for step in range(start_step, args.num_iterations + 1):
                         return_logits=False,
                         aux_coeff=args.aux_coeff_val,
                         diff_topk_reg_coeff=diff_topk_reg_coeff,
+                        diff_weight=diff_weight
                     )
                     val_loss += loss.detach()
                     val_ce_loss += ce_loss.detach()
@@ -411,7 +419,7 @@ for step in range(start_step, args.num_iterations + 1):
         gc.collect()
         with ctx:
             _, loss_ce, ce_loss_probe, total_aux_probe, _, _, _, _, _, _, _, _ = model(
-                x_probe, y_probe, return_logits=False, aux_coeff=0.0, diff_topk_reg_coeff=0.0
+                x_probe, y_probe, return_logits=False, aux_coeff=0.0, diff_topk_reg_coeff=0.0, diff_weight=diff_weight
             )
         loss_ce.backward()
         ce_router_layer_grad_norms = []
@@ -433,7 +441,7 @@ for step in range(start_step, args.num_iterations + 1):
         gc.collect()
         with ctx:
             _, _, _, total_aux_probe, _, _, _, _, _, _, _, _ = model(
-                x_probe, y_probe, return_logits=False, aux_coeff=0.0, diff_topk_reg_coeff=0.0
+                x_probe, y_probe, return_logits=False, aux_coeff=0.0, diff_topk_reg_coeff=0.0, diff_weight=diff_weight
             )
         # Backprop aux explicitly
         total_aux_probe.backward()
@@ -468,6 +476,7 @@ for step in range(start_step, args.num_iterations + 1):
                         aux_coeff=0.0,
                         diff_topk_reg_coeff=0.0,
                         return_expert_assignments=True,
+                        diff_weight=diff_weight
                     )
                     # current_assignments shape: (n_layers, 100, seq_len, top_k)
                     sorted_curr_assignments = current_assignments.clone().sort(dim=-1)[0]
@@ -525,6 +534,7 @@ for step in range(start_step, args.num_iterations + 1):
                 topk_change_percentages,
                 any_topk_changed_percentages,
                 ROUTER_VALUE_KEYS,
+                diff_weight,
             )
 
         # start the clock again
@@ -585,7 +595,7 @@ for step in range(start_step, args.num_iterations + 1):
             cached_batches.append((x.clone(), y.clone()))
             with torch.no_grad():
                 with ctx:
-                    model(x, y, return_logits=False, aux_coeff=0.0, diff_topk_reg_coeff=0.0, router_context=collect_context)
+                    model(x, y, return_logits=False, aux_coeff=0.0, diff_topk_reg_coeff=0.0, router_context=collect_context, diff_weight=diff_weight)
             x, y = train_loader.next_batch()
         dist.all_reduce(tokens_accum, op=dist.ReduceOp.SUM)
         dist.all_reduce(totals_accum, op=dist.ReduceOp.SUM)
@@ -631,6 +641,7 @@ for step in range(start_step, args.num_iterations + 1):
                 aux_coeff=args.aux_coeff_train,
                 diff_topk_reg_coeff=diff_topk_reg_coeff,
                 router_context=router_context_use,
+                diff_weight=diff_weight
             )
             train_loss = loss.detach()
             diff_topk_reg_sum = diff_topk_reg_sum + total_diff_topk_reg.detach()

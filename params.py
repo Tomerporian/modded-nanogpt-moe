@@ -75,6 +75,10 @@ def _build_training_parser():
                        help='number of iterations to run')
     group.add_argument('--warmup-iters', default=0, type=int,
                        help='number of warmup iterations')
+    group.add_argument('--transition-start-iter', default=-1, type=int,
+                    help='transition between diff and switch start iterations')
+    group.add_argument('--transition-end-iter', default=-1, type=int,
+                    help='transition between diff and switch end iterations')
     group.add_argument('--warmdown-iters', default=1308, type=int,
                        help='iterations of linear warmup/warmdown for triangular or trapezoidal schedule')
     group.add_argument('--triangle-up-iters', default=0, type=int,

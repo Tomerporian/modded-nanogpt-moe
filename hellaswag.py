@@ -5,7 +5,7 @@ from dataclasses import MISSING, fields
 from pathlib import Path
 from typing import Any
 
-import arguably
+import argparse
 import torch
 import yaml
 from loguru import logger
@@ -83,6 +83,25 @@ def _load_model_state(checkpoint_path: Path, map_location: str | torch.device) -
     if isinstance(state, dict):
         return state
     raise ValueError(f"Unrecognized checkpoint structure in {checkpoint_path}")
+
+
+def _strip_prefix(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
+    if not prefix:
+        return state_dict
+    return {
+        (key[len(prefix):] if key.startswith(prefix) else key): value
+        for key, value in state_dict.items()
+    }
+
+
+def _normalize_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    if not state_dict:
+        return state_dict
+    if any(key.startswith("_orig_mod.") for key in state_dict):
+        return _strip_prefix(state_dict, "_orig_mod.")
+    if any(key.startswith("module.") for key in state_dict):
+        return _strip_prefix(state_dict, "module.")
+    return state_dict
 
 
 class CustomConfig(PretrainedConfig):
@@ -180,35 +199,53 @@ def _default_results_path(run_dir: Path, tasks: list[str]) -> Path:
     return run_dir / filename
 
 
-@arguably.command()
-def main(
-    run_dir: str,
-    checkpoint: str | None = None,
-    limit: int | None = None,
-    log_level: str = "INFO",
-    device: str | None = None,
-    tasks: str = "hellaswag",
-    batch_size: int = 1,
-    tokenizer_name: str = "gpt2",
-    results_file: str | None = None,
-):
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Evaluate a trained checkpoint on lm-eval tasks such as hellaswag."
+    )
+    parser.add_argument("--run_dir", type=str, required=True,
+        help="Training run directory containing args.yaml/spec.yaml.")
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Checkpoint filename or path (default: latest state_step*.pt).",
+    )
+    parser.add_argument("--limit", type=int, default=None, help="Limit number of eval examples.")
+    parser.add_argument("--log-level", default="INFO", help="Loguru log level (default: INFO).")
+    parser.add_argument("--device", default=None, help="Device override (e.g. cpu, cuda).")
+    parser.add_argument(
+        "--tasks",
+        default="hellaswag",
+        help="Comma-separated lm-eval tasks (default: hellaswag).",
+    )
+    parser.add_argument("--batch-size", type=int, default=1, help="Eval batch size.")
+    parser.add_argument("--tokenizer-name", default="gpt2", help="Tokenizer name or path.")
+    parser.add_argument(
+        "--results-file",
+        default=None,
+        help="Output YAML filename (default: <task>.yaml or lm_eval_results.yaml).",
+    )
+    return parser
+
+
+def main(args: argparse.Namespace) -> None:
     """
     Evaluate a trained checkpoint on lm-eval tasks such as hellaswag.
     """
 
     logger.remove()
-    logger.add(sys.stderr, level=log_level.upper())
+    logger.add(sys.stderr, level=args.log_level.upper())
 
-    run_path = Path(run_dir).expanduser().resolve()
+    run_path = Path(args.run_dir).expanduser().resolve()
     if not run_path.is_dir():
         raise FileNotFoundError(f"{run_path} is not a directory")
 
-    checkpoint_path = _resolve_checkpoint(run_path, checkpoint)
+    checkpoint_path = _resolve_checkpoint(run_path, args.checkpoint)
     train_args = _load_run_args(run_path)
     gpt_config = _build_gpt_config(train_args)
 
     context_length = int(train_args.get("sequence_length", 1024))
-    tokenizer = _configure_tokenizer(tokenizer_name, context_length)
+    tokenizer = _configure_tokenizer(args.tokenizer_name, context_length)
 
     hf_config = CustomConfig(
         vocab_size=gpt_config.vocab_size,
@@ -222,11 +259,13 @@ def main(
     )
 
     target_device = torch.device(
-        device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+        args.device
+        if args.device is not None
+        else ("cuda" if torch.cuda.is_available() else "cpu")
     )
     logger.info(f"Using device {target_device}")
 
-    state_dict = _load_model_state(checkpoint_path, map_location="cpu")
+    state_dict = _normalize_state_dict(_load_model_state(checkpoint_path, map_location="cpu"))
     base_model = GPT(gpt_config)
     missing = base_model.load_state_dict(state_dict, strict=True)
     if missing.unexpected_keys or missing.missing_keys:
@@ -240,14 +279,14 @@ def main(
     hf_model = CustomModel(hf_config, base_model).to(target_device)
     hf_model.eval()
 
-    task_list = [task.strip() for task in tasks.split(",") if task.strip()]
+    task_list = [task.strip() for task in args.tasks.split(",") if task.strip()]
     if not task_list:
         raise ValueError("At least one task must be provided")
 
     wrapped_model = HFLM(
         pretrained=hf_model,
         tokenizer=tokenizer,
-        batch_size=batch_size,
+        batch_size=args.batch_size,
         device=str(target_device),
     )
 
@@ -256,7 +295,7 @@ def main(
     results_raw = evaluator.simple_evaluate(
         model=wrapped_model,
         tasks=task_list,
-        limit=limit,
+        limit=args.limit,
         verbosity="DEBUG",
     )
     elapsed = time.time() - start
@@ -272,8 +311,8 @@ def main(
                 logger.success(f"{task} metrics: {task_metrics}")
 
     results_path = (
-        Path(results_file).expanduser().resolve()
-        if results_file
+        Path(args.results_file).expanduser().resolve()
+        if args.results_file
         else _default_results_path(run_path, task_list)
     )
     if not results_path.is_absolute():
@@ -292,4 +331,5 @@ def main(
 
 
 if __name__ == "__main__":
-    arguably.run()
+    parser = _build_parser()
+    main(parser.parse_args())

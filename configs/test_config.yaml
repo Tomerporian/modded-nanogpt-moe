@@ -1,10 +1,10 @@
 job_details:
-  name: transition_diff_switch
-  output_dir: /home/ycarmon/no_backup/users/sachter/models/modded_moe/test_multiple
+  name: diff_no_softmax
+  output_dir: /data/mikey/exps/test/
 
 parameters:
-  input_bin: ["/home/ycarmon/no_backup/users/sachter/data/openwebtext/tokenized_owt2/train.bin"]
-  input_val_bin: ["/home/ycarmon/no_backup/users/sachter/data/openwebtext/tokenized_owt2/val.bin"]
+  input_bin: ["/data/mikey/fineweb10B/fineweb_train_000001.bin"]
+  input_val_bin: ["/data/mikey/fineweb10B/fineweb_val_000000.bin"]
   
   n_layer: [6]
   n_head: [4]
@@ -26,12 +26,12 @@ parameters:
 
   seed: [1000]
   use_adamw_opt3: [false]
-  # aux_coeff_train: [1.0]
-  # aux_coeff_val: [1.0]
-  theta_load_balance_coeff: [0.1]
-  lr_theta: [0.001]
-  theta_lb_detach_theta: [false]
-  theta_lb_detach_logits: [false]
+  aux_coeff_train: [0.1]
+  aux_coeff_val: [0.1]
+  # theta_load_balance_coeff: [0.1]
+  # lr_theta: [0.001]
+  # theta_lb_detach_theta: [false]
+  # theta_lb_detach_logits: [false]
   # global_load_balance: [false]
   # diff_topk_regularizer_max_coeff: [0.1]
 
@@ -39,8 +39,8 @@ parameters:
   warmdown_iters: [0]
   resume: ['auto'] # Checkpoint path
   router_type: ['diff_no_softmax']
-  transition_start_iter: [40]
-  transition_end_iter: [80]
+  # transition_start_iter: [40]
+  # transition_end_iter: [80]
   
 
   # mandatory resume params

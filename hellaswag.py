@@ -104,6 +104,37 @@ def _normalize_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torc
     return state_dict
 
 
+def _to_serializable(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {key: _to_serializable(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        converted = [_to_serializable(value) for value in obj]
+        return converted if isinstance(obj, list) else tuple(converted)
+    if callable(obj):
+        name = getattr(obj, "__name__", None)
+        if name:
+            return f"<callable {name}>"
+        return "<callable>"
+    if isinstance(obj, torch.dtype):
+        return str(obj)
+    if isinstance(obj, torch.device):
+        return str(obj)
+    if isinstance(obj, torch.Tensor):
+        if obj.numel() == 1:
+            return obj.item()
+        return obj.detach().cpu().tolist()
+    try:
+        import numpy as np  # type: ignore
+    except ImportError:
+        np = None
+    if np is not None:
+        if isinstance(obj, np.generic):
+            return obj.item()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+    return obj
+
+
 class CustomConfig(PretrainedConfig):
     model_type = "modded_nanogpt_moe"
 
@@ -324,6 +355,7 @@ def main(args: argparse.Namespace) -> None:
         payload = results_raw["results"][task_list[0]]
     else:
         payload = results_raw
+    payload = _to_serializable(payload)
 
     with open(results_path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(payload, handle)

@@ -1,0 +1,55 @@
+job_details:
+  name: test_global_lb
+  output_dir: /home/ycarmon/no_backup/users/sachter/models/modded_moe/test_multiple
+
+parameters:
+  input_bin: ["/home/ycarmon/no_backup/users/sachter/data/openwebtext/tokenized_owt2/train.bin"]
+  input_val_bin: ["/home/ycarmon/no_backup/users/sachter/data/openwebtext/tokenized_owt2/val.bin"]
+
+  # Model parameters
+  vocab_size: [50304]
+  n_layer: [12]
+  n_head: [6] # change to 12?
+  n_embd: [768]
+  num_experts: [8]
+  top_k: [2]
+  router_type: ['switch']
+
+  # Optimization parameters
+  batch_size: [512]  # 8*64
+  device_batch_size: [16]
+  sequence_length: [1024]
+  num_iterations: [200] # was 4578 before
+  warmup_iters: [0]
+  warmdown_iters: [10] # was 1308 before
+  weight_decay: [0.0]
+  use_adamw_opt3: [false]
+  # Learning rate parameters
+  lr_embed: [0.3]
+  lr_head: [0.002]
+  lr_muon: [0.02]
+  momentum: [0.95]
+
+  # Evaluation and logging parameters
+  val_loss_every: [10]
+  val_tokens: [524288]
+  save_every: [0]
+  wandb_project: ["modded-nanogpt-moe-test"]
+  output: ["logs"]
+
+  # Loss parameters
+  aux_coeff_train: [0.1]
+  aux_coeff_val: [0.1]
+
+  # Run config
+  device_0: [false]
+  seed: [1000]
+
+  # global_load_balance: [true, false]
+  LIST_TESTS:
+    - loss_free_mode: ['deepseek']
+      router_type: ['switch']
+    - loss_free_mode: ['stopgrad']
+      router_type: ['switch']
+
+

@@ -1,17 +1,16 @@
 #!/bin/bash
-##SBATCH --job-name=tau_run_moe
-##SBATCH --output=/home/ycarmon/no_backup/users/sachter/logs/tmp/%x.out
-##SBATCH --error=/home/ycarmon/no_backup/users/sachter/logs/tmp/%x.err
+#SBATCH --job-name=run_lm_eval
+#SBATCH --output=/home/ycarmon/no_backup/users/sachter/logs/tmp/%x.out
+#SBATCH --error=/home/ycarmon/no_backup/users/sachter/logs/tmp/%x.err
 #SBATCH --partition=killable  # gpu-h100-killable
 #SBATCH --time=1-00:00:00
 #SBATCH --nodes=1
-#SBATCH --ntasks=4
+#SBATCH --ntasks=1
 #SBATCH --gpus-per-task=1
 #SBATCH --gpu-bind=single:1
 #SBATCH --cpus-per-task=5
-##SBATCH --nodelist=n-801,n-802,n-803,n-804,n-805,n-301
-#SBATCH --constraint="l40s|a6000" # |a6000|l40s|a6000|tesla_v100
-##SBATCH --exclude=n-601,n-602
+#SBATCH --constraint="geforce_rtx_3090|a6000|l40s" # |a6000|l40s|a6000|tesla_v100
+#SBATCH --exclude=rack-gww-dgx1,rack-bgw-dgx1,n-301,n-302,n-602
 
 
 cd /home/ycarmon/users/sachter/repos/modded-nanogpt-moe
@@ -23,24 +22,14 @@ export TORCH_COMPILE_DEBUG_DIR="/home/ycarmon/no_backup/users/sachter/.cache/tor
 export TORCHINDUCTOR_CACHE_DIR="/home/ycarmon/no_backup/users/sachter/.cache/torchinductor_cache"
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
-export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_$USER
-mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
-
-# wandb login
-export WANDB_API_KEY="REMOVED"
-export WANDB__SERVICE_WAIT=300
-echo "WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT}"
-export WANDB_DIR="/home/ycarmon/no_backup/users/sachter/.cache/wandb"
-wandb login ${WANDB_API_KEY}
-echo "logged in to wandb"
-
-
 get_free_port() {
     python3 -c "import socket; s = socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()"
 }
 MASTER_PORT=$(get_free_port)
 echo "Using master port: $MASTER_PORT"
 
+#export PYTHONPATH="/home/ycarmon/users/sachter/repos/modded-nanogpt-moe:${PYTHONPATH}"
 
-
-torchrun --master_port=$MASTER_PORT --nproc_per_node=4 train_gpt_moe.py --config $1
+python hellaswag.py \
+    --run-dir /home/ycarmon/no_backup/users/sachter/models/modded_moe/test_multiple/25-12-31-test_save_cp/000_25-12-31-test_save_cp+lr_muo=0.2/ \
+    --limit 10

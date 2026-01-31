@@ -1,0 +1,54 @@
+job_details:
+  name: transition_diff_switch
+  output_dir: /home/ycarmon/no_backup/users/sachter/models/modded_moe/test_multiple
+
+parameters:
+  input_bin: ["/home/ycarmon/no_backup/users/sachter/data/openwebtext/tokenized_owt2/train.bin"]
+  input_val_bin: ["/home/ycarmon/no_backup/users/sachter/data/openwebtext/tokenized_owt2/val.bin"]
+  
+  n_layer: [6]
+  n_head: [4]
+  n_embd: [32]
+  num_experts: [8]
+  top_k: [2]
+  router_depth: [1]
+
+  batch_size: [8]
+  device_batch_size: [4]
+  sequence_length: [64]
+  # num_iterations: [500]
+  val_loss_every: [5]
+  val_tokens: [1024]
+  save_every: [5]
+  save_only_latest: [true]
+
+  wandb_project: ['modded-nanogpt-moe-test']
+
+  seed: [1000]
+  use_adamw_opt3: [false]
+  # aux_coeff_train: [1.0]
+  # aux_coeff_val: [1.0]
+  theta_load_balance_coeff: [0.1]
+  lr_theta: [0.001]
+  theta_lb_detach_theta: [false]
+  theta_lb_detach_logits: [false]
+  # global_load_balance: [false]
+  # diff_topk_regularizer_max_coeff: [0.1]
+
+  num_iterations: [100] # increase from 500 to 100 decay iters
+  warmdown_iters: [0]
+  resume: ['auto'] # Checkpoint path
+  router_type: ['diff_no_softmax']
+  transition_start_iter: [40]
+  transition_end_iter: [80]
+  
+
+  # mandatory resume params
+  # num_iterations: [700] # increase from 500 to 100 decay iters
+  # triangle_up_iterations: [20]
+  # warmdown_iters: [80]
+  # resume: ['/home/ycarmon/no_backup/users/sachter/models/modded_moe/test_multiple/26-01-04-test_theta_lb_detach_logits_switch/017_26-01-04-test_theta_lb_detach_logits_switch+the_loa_bal_coe=0.06+lr_the=0.001+dif_top_reg_max_coe=0.05/state_step000500.pt'] # Checkpoint path
+  # router_type: ['diff']
+  # lr_scheduler: ['triangle_resume']
+  # min_lr: [0.1, 1]
+

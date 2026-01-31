@@ -5,13 +5,12 @@
 #SBATCH --partition=killable  # gpu-h100-killable
 #SBATCH --time=1-00:00:00
 #SBATCH --nodes=1
-#SBATCH --ntasks=4
+#SBATCH --ntasks=1
 #SBATCH --gpus-per-task=1
 #SBATCH --gpu-bind=single:1
 #SBATCH --cpus-per-task=5
-##SBATCH --nodelist=n-801,n-802,n-803,n-804,n-805,n-301
-#SBATCH --constraint="l40s|a6000" # |a6000|l40s|a6000|tesla_v100
-##SBATCH --exclude=n-601,n-602
+#SBATCH --constraint="geforce_rtx_3090|a6000|l40s" # |a6000|l40s|a6000|tesla_v100
+#SBATCH --exclude=rack-gww-dgx1,rack-bgw-dgx1,n-301,n-302,n-602
 
 
 cd /home/ycarmon/users/sachter/repos/modded-nanogpt-moe
@@ -22,9 +21,6 @@ export TRITON_CACHE_DIR="/home/ycarmon/no_backup/users/sachter/.cache/triton_cac
 export TORCH_COMPILE_DEBUG_DIR="/home/ycarmon/no_backup/users/sachter/.cache/torch_compile_debug"
 export TORCHINDUCTOR_CACHE_DIR="/home/ycarmon/no_backup/users/sachter/.cache/torchinductor_cache"
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
-
-export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_$USER
-mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
 
 # wandb login
 export WANDB_API_KEY="REMOVED"
@@ -42,5 +38,4 @@ MASTER_PORT=$(get_free_port)
 echo "Using master port: $MASTER_PORT"
 
 
-
-torchrun --master_port=$MASTER_PORT --nproc_per_node=4 train_gpt_moe.py --config $1
+torchrun --master_port=$MASTER_PORT --nproc_per_node=1 train_gpt_moe.py --config $1

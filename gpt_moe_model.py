@@ -89,17 +89,23 @@ class CausalSelfAttention(nn.Module):
         return max_per_head.amax(dim=0)
 
     @dynamo.disable
-    def _update_qk_logit_max(self, q, k):
-        if (self.qk_clip_tau <= 0.0 and not self.log_attn_logits) or not self.training:
+    def _update_qk_clip_max(self, q, k):
+        if self.qk_clip_tau <= 0.0 or not self.training:
             return
         with torch.no_grad():
             qk_max = self._compute_qk_clip_max(q.detach(), k.detach())
             if qk_max is None:
                 return
-            if self.qk_clip_tau > 0.0:
-                self.qk_clip_max.copy_(torch.maximum(self.qk_clip_max, qk_max))
-            if self.log_attn_logits:
-                self.attn_logit_max.copy_(torch.maximum(self.attn_logit_max, qk_max))
+            self.qk_clip_max.copy_(torch.maximum(self.qk_clip_max, qk_max))
+
+    def _update_attn_logit_max(self, q, k):
+        if not self.log_attn_logits or not self.training:
+            return
+        with torch.no_grad():
+            qk_max = self._compute_qk_clip_max(q.detach(), k.detach())
+            if qk_max is None:
+                return
+            self.attn_logit_max.copy_(torch.maximum(self.attn_logit_max, qk_max))
 
     def apply_qk_clip(self, head_scale):
         if head_scale is None or head_scale.numel() != self.n_head:
@@ -118,8 +124,10 @@ class CausalSelfAttention(nn.Module):
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q = Rotary.apply_rotary_emb(q, cos, sin)
         k = Rotary.apply_rotary_emb(k, cos, sin)
-        if (self.qk_clip_tau > 0.0 or self.log_attn_logits) and self.training:
-            self._update_qk_logit_max(q, k)
+        if self.qk_clip_tau > 0.0 and self.training:
+            self._update_qk_clip_max(q, k)
+        if self.log_attn_logits and self.training:
+            self._update_attn_logit_max(q, k)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)

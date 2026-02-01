@@ -78,6 +78,63 @@ class Muon(torch.optim.Optimizer):
                 curr_idx += p.numel()
 
 
+class MuonClip(torch.optim.Optimizer):
+    """
+    MuonClip - Muon with consistent update RMS scaling and decoupled weight decay.
+    """
+
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+                 backend='newtonschulz5', backend_steps=5, weight_decay=0.0,
+                 update_scale=0.2):
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            backend=backend,
+            backend_steps=backend_steps,
+            weight_decay=weight_decay,
+            update_scale=update_scale,
+        )
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            zeropower_backend = zeropower_backends[group['backend']]
+            weight_decay = group['weight_decay']
+            update_scale = group['update_scale']
+
+            total_params = sum(p.numel() for p in group['params'])
+            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
+            curr_idx = 0
+            for i, p in enumerate(group['params']):
+                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
+                    g = p.grad
+                    assert g is not None
+                    state = self.state[p]
+                    if 'momentum_buffer' not in state:
+                        state['momentum_buffer'] = torch.zeros_like(g)
+                    buf = state['momentum_buffer']
+                    buf.mul_(momentum).add_(g)
+                    if group['nesterov']:
+                        g = g.add(buf, alpha=momentum)
+                    g = zeropower_backend(g, steps=group['backend_steps'])
+                    scale = (max(g.size(0), g.size(1)) ** 0.5) * update_scale
+                    g *= scale
+                    updates_flat[curr_idx:curr_idx + p.numel()] = g.flatten()
+                curr_idx += p.numel()
+
+            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            curr_idx = 0
+            for p in group['params']:
+                if weight_decay != 0.0:
+                    p.data.mul_(1.0 - lr * weight_decay)
+                g = updates_flat[curr_idx:curr_idx + p.numel()].view_as(p.data).type_as(p.data)
+                p.data.add_(g, alpha=-lr)
+                curr_idx += p.numel()
+
 def _collect_router_temperature_params(raw_model):
     temperature_params = []
     if not getattr(raw_model.config, "use_router_temperature", False):
@@ -147,15 +204,23 @@ def get_optimizers(raw_model, args):
         theta_param_ids = {id(p) for p in theta_params}
         all_h_params = [p for p in all_h_params if id(p) not in theta_param_ids]
 
+    muon_cls = MuonClip if getattr(args, "use_muon_clip", False) else Muon
+    muon_kwargs = dict(
+        lr=args.lr_muon,
+        momentum=args.momentum,
+        backend=args.muon_svd_backend,
+        nesterov=args.muon_nesterov,
+        backend_steps=args.muon_backend_steps,
+    )
+    if muon_cls is MuonClip:
+        muon_kwargs["weight_decay"] = args.weight_decay
+        muon_kwargs["update_scale"] = args.muon_update_scale
+
     if args.only_router_muon:
         router_params = _collect_router_params(raw_model)
-        router_optimizer = Muon(
+        router_optimizer = muon_cls(
             router_params,
-            lr=args.lr_muon,
-            momentum=args.momentum,
-            backend=args.muon_svd_backend,
-            nesterov=args.muon_nesterov,
-            backend_steps=args.muon_backend_steps,
+            **muon_kwargs,
         )
         router_param_ids = {id(p) for p in router_params}
         blocks_params = [p for p in all_h_params if id(p) not in router_param_ids]
@@ -185,22 +250,14 @@ def get_optimizers(raw_model, args):
         )
         router_param_ids = {id(p) for p in router_params}
         muon_params = [p for p in all_h_params if id(p) not in router_param_ids]
-        optimizer3 = Muon(
+        optimizer3 = muon_cls(
             muon_params,
-            lr=args.lr_muon,
-            momentum=args.momentum,
-            backend=args.muon_svd_backend,
-            nesterov=args.muon_nesterov,
-            backend_steps=args.muon_backend_steps,
+            **muon_kwargs,
         )
     else:
-        optimizer3 = Muon(
+        optimizer3 = muon_cls(
             all_h_params,
-            lr=args.lr_muon,
-            momentum=args.momentum,
-            backend=args.muon_svd_backend,
-            nesterov=args.muon_nesterov,
-            backend_steps=args.muon_backend_steps,
+            **muon_kwargs,
         )
 
     theta_optimizer = None
@@ -232,4 +289,4 @@ def get_optimizers(raw_model, args):
     return optimizers, router_optimizer, router_temperature_optimizer
 
 
-__all__ = ["Muon", "get_optimizers"]
+__all__ = ["Muon", "MuonClip", "get_optimizers"]

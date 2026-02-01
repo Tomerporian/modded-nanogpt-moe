@@ -95,12 +95,20 @@ def _build_training_parser():
                        help='optimize router parameters with AdamW instead of Muon (requires learned routers)')
     group.add_argument('--only-router-muon', action='store_true', default=False,
                        help='use Muon only for router parameters and AdamW for the rest of the transformer blocks')
+    group.add_argument('--use-muon-clip', action='store_true', default=False,
+                       help='use MuonClip (Muon with consistent RMS update scaling and weight decay)')
     group.add_argument('--muon-svd-backend', default='newtonschulz5', type=str, choices=['newtonschulz5', 'svd'],
                        help='method used for Muon orthogonalization backend')
     group.add_argument('--muon-nesterov', type=_str2bool, default=True, metavar='BOOL',
                        help='use Nesterov momentum in the Muon optimizer')
     group.add_argument('--muon-backend-steps', type=int, default=5,
                        help='iteration steps for the Muon backend orthogonalization')
+    group.add_argument('--muon-update-scale', type=float, default=0.2,
+                       help='update RMS scale used by MuonClip (paper default: 0.2)')
+    group.add_argument('--qk-clip-tau', type=float, default=0.0,
+                       help='QK-Clip logit threshold (0 disables)')
+    group.add_argument('--qk-clip-block-size', type=int, default=128,
+                       help='block size for QK-Clip max logit computation')
 
     # Learning rate parameters
     group = parser.add_argument_group('Learning rate parameters')
@@ -133,6 +141,8 @@ def _build_training_parser():
                        help='number of sequences to track for expert assignment changes')
     group.add_argument('--wandb-project', default='modded-nanogpt-moe', type=str,
                        help='wandb project name')
+    group.add_argument('--log-attn-logits', type=_str2bool, default=False, metavar='BOOL',
+                       help='log max attention logits (extra matmul cost)')
     group.add_argument('--output', default='logs', type=str,
                        help='output directory for logs and checkpoints')
 

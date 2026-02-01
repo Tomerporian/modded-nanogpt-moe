@@ -5,6 +5,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
+import torch._dynamo as dynamo
 
 
 ROUTER_VALUE_KEYS = (
@@ -64,6 +65,49 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
+        self.qk_clip_tau = getattr(config, "qk_clip_tau", 0.0)
+        self.qk_clip_block_size = getattr(config, "qk_clip_block_size", 128)
+        self.log_attn_logits = getattr(config, "log_attn_logits", False)
+        self.register_buffer("qk_clip_max", torch.zeros(self.n_head, dtype=torch.float32), persistent=False)
+        self.register_buffer("attn_logit_max", torch.zeros(self.n_head, dtype=torch.float32), persistent=False)
+
+    def _compute_qk_clip_max(self, q, k):
+        q = q.float().transpose(1, 2)  # B, H, T, D
+        k = k.float().transpose(1, 2)  # B, H, T, D
+        _, _, seq_len, head_dim = q.shape
+        scale = 1.0 / math.sqrt(head_dim)
+        block = self.qk_clip_block_size if self.qk_clip_block_size > 0 else seq_len
+        k_t = k.transpose(-1, -2)
+        max_per_head = None
+        for start in range(0, seq_len, block):
+            q_chunk = q[:, :, start:start + block, :]
+            scores = torch.matmul(q_chunk, k_t) * scale
+            chunk_max = scores.amax(dim=-1).amax(dim=-1)
+            max_per_head = chunk_max if max_per_head is None else torch.maximum(max_per_head, chunk_max)
+        if max_per_head is None:
+            return None
+        return max_per_head.amax(dim=0)
+
+    @dynamo.disable
+    def _update_qk_logit_max(self, q, k):
+        if (self.qk_clip_tau <= 0.0 and not self.log_attn_logits) or not self.training:
+            return
+        with torch.no_grad():
+            qk_max = self._compute_qk_clip_max(q.detach(), k.detach())
+            if qk_max is None:
+                return
+            if self.qk_clip_tau > 0.0:
+                self.qk_clip_max.copy_(torch.maximum(self.qk_clip_max, qk_max))
+            if self.log_attn_logits:
+                self.attn_logit_max.copy_(torch.maximum(self.attn_logit_max, qk_max))
+
+    def apply_qk_clip(self, head_scale):
+        if head_scale is None or head_scale.numel() != self.n_head:
+            return
+        with torch.no_grad():
+            scale = head_scale.to(dtype=self.c_q.weight.dtype, device=self.c_q.weight.device).view(self.n_head, 1, 1)
+            self.c_q.weight.view(self.n_head, self.head_dim, self.n_embd).mul_(scale)
+            self.c_k.weight.view(self.n_head, self.head_dim, self.n_embd).mul_(scale)
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -74,6 +118,8 @@ class CausalSelfAttention(nn.Module):
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q = Rotary.apply_rotary_emb(q, cos, sin)
         k = Rotary.apply_rotary_emb(k, cos, sin)
+        if (self.qk_clip_tau > 0.0 or self.log_attn_logits) and self.training:
+            self._update_qk_logit_max(q, k)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
@@ -666,6 +712,9 @@ class GPTConfig:
     theta_load_balance_coeff : float = 0.0
     theta_lb_detach_theta : bool = True
     theta_lb_detach_logits : bool = True
+    qk_clip_tau : float = 0.0
+    qk_clip_block_size : int = 128
+    log_attn_logits : bool = False
 
 
 class GPT(nn.Module):
@@ -682,6 +731,36 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_()
+
+    def apply_qk_clip(self, tau=None):
+        tau = self.config.qk_clip_tau if tau is None else tau
+        if tau is None or tau <= 0.0:
+            return
+        if not self.transformer.h:
+            return
+        qk_max = torch.stack([block.attn.qk_clip_max for block in self.transformer.h])
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(qk_max, op=dist.ReduceOp.MAX)
+        if torch.all(qk_max <= 0):
+            return
+        gamma = torch.clamp(tau / (qk_max + 1e-6), max=1.0)
+        scale = torch.sqrt(gamma)
+        for layer_idx, block in enumerate(self.transformer.h):
+            block.attn.apply_qk_clip(scale[layer_idx])
+        for block in self.transformer.h:
+            block.attn.qk_clip_max.zero_()
+
+    def collect_attn_logit_max(self):
+        if not self.transformer.h or not self.transformer.h[0].attn.log_attn_logits:
+            return None
+        attn_max = torch.stack([block.attn.attn_logit_max for block in self.transformer.h])
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(attn_max, op=dist.ReduceOp.MAX)
+        return attn_max
+
+    def reset_attn_logit_max(self):
+        for block in self.transformer.h:
+            block.attn.attn_logit_max.zero_()
 
     def forward(
         self,

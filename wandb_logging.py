@@ -53,6 +53,48 @@ def log_router_values(layer_router_values_avg, total_router_values_avg, router_v
     return log
 
 
+def log_attention_logits(attn_logit_max):
+    log = {}
+    if attn_logit_max is None:
+        return log
+    per_layer_max = attn_logit_max.max(dim=-1).values
+    per_layer_mean = attn_logit_max.mean(dim=-1)
+    for li in range(per_layer_max.numel()):
+        log[f'attn_logits/max/Layer {li}'] = float(per_layer_max[li].item())
+        log[f'attn_logits/mean/Layer {li}'] = float(per_layer_mean[li].item())
+    log['attn_logits/max'] = float(per_layer_max.max().item())
+    log['attn_logits/mean'] = float(per_layer_mean.mean().item())
+    return log
+
+
+def log_router_weight_norms(raw_model, prefix):
+    log = {}
+    layer_means = []
+    layer_maxs = []
+    for li, block in enumerate(raw_model.transformer.h):
+        norms = []
+        router = getattr(block.mlp, 'router', None)
+        if router is not None:
+            for param in router.parameters():
+                norms.append(param.detach().float().norm(2))
+        scaler = getattr(block.mlp, 'router_scaler', None)
+        if scaler is not None:
+            for param in scaler.parameters():
+                norms.append(param.detach().float().norm(2))
+        if norms:
+            norms_tensor = torch.stack(norms)
+            mean_val = norms_tensor.mean()
+            max_val = norms_tensor.max()
+            layer_means.append(mean_val)
+            layer_maxs.append(max_val)
+            log[f'{prefix}/mean/Layer {li}'] = float(mean_val.item())
+            log[f'{prefix}/max/Layer {li}'] = float(max_val.item())
+    if layer_means:
+        log[f'{prefix}/mean'] = float(torch.stack(layer_means).mean().item())
+        log[f'{prefix}/max'] = float(torch.stack(layer_maxs).max().item())
+    return log
+
+
 def log_loss_free_bias(raw_model, prefix):
     log = {}
     for li, block in enumerate(raw_model.transformer.h):
@@ -121,6 +163,7 @@ def wandb_train_log(
     num_experts,
     router_value_keys,
     diff_topk_reg_coeff,
+    attn_logit_max,
 ):
     log = {
         'train/loss': float(train_loss.item()),
@@ -141,9 +184,11 @@ def wandb_train_log(
     log.update(log_entropy(layer_router_entropy_avg))
     log.update(log_expert_balance(expert_balance_avg, layer_expert_balance_avg, num_experts, 'train'))
     log.update(log_router_values(layer_router_values_avg, total_router_values_avg, router_value_keys))
+    log.update(log_router_weight_norms(raw_model, 'router_weight_norm'))
     log.update(log_loss_free_bias(raw_model, 'train'))
     log.update(log_theta_stats(raw_model, 'thetas'))
     log.update(_collect_router_temperatures(raw_model))
+    log.update(log_attention_logits(attn_logit_max))
     wandb.log(log, step=log_step)
 
 

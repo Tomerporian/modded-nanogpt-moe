@@ -152,6 +152,9 @@ model = GPT(GPTConfig(
     theta_load_balance_coeff=args.theta_load_balance_coeff,
     theta_lb_detach_theta=args.theta_lb_detach_theta,
     theta_lb_detach_logits=args.theta_lb_detach_logits,
+    qk_clip_tau=args.qk_clip_tau,
+    qk_clip_block_size=args.qk_clip_block_size,
+    log_attn_logits=args.log_attn_logits,
 ))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
@@ -681,6 +684,8 @@ for step in range(start_step, args.num_iterations + 1):
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
         sched.step()
+    if args.qk_clip_tau > 0.0:
+        raw_model.apply_qk_clip()
 
     # null the gradients
     model.zero_grad(set_to_none=True)
@@ -708,6 +713,9 @@ for step in range(start_step, args.num_iterations + 1):
     for key in ROUTER_VALUE_KEYS:
         dist.all_reduce(layer_router_values_avg[key], op=dist.ReduceOp.AVG)
         dist.all_reduce(total_router_values_avg[key], op=dist.ReduceOp.AVG)
+    attn_logit_max = None
+    if args.log_attn_logits:
+        attn_logit_max = raw_model.collect_attn_logit_max()
     # --------------- TRAINING SECTION END -------------------
 
     if master_process:
@@ -736,7 +744,10 @@ for step in range(start_step, args.num_iterations + 1):
             num_experts,
             ROUTER_VALUE_KEYS,
             diff_topk_reg_coeff,
+            attn_logit_max,
         )
+    if args.log_attn_logits:
+        raw_model.reset_attn_logit_max()
 
 if master_process:
     logging.info(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")

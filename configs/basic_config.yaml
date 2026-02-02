@@ -1,5 +1,5 @@
 job_details:
-  name: diff_no_softmax-muon_clip-wd01
+  name: diff_no_softmax-muon-wd001_only_muon
   output_dir: /data/mikey/exps/full/
 parameters:
   input_bin: ["/data/mikey/fineweb10B/fineweb_train_*.bin"]
@@ -18,7 +18,7 @@ parameters:
   num_iterations: [6000] # was 4578 before. # 6000 for tomer
   warmup_iters: [0]
   warmdown_iters: [1714] # was 1308 before. # 1714 for tomer
-  weight_decay: [0.1]
+  weight_decay: [0.01]
   use_adamw_opt3: [false]
   # Learning rate parameters
   lr_embed: [0.3]
@@ -47,7 +47,7 @@ parameters:
   num_experts: [64]
   top_k: [16]
   hidden_dim_scale_factor: [0.5]
-  use_muon_clip: [true]
+  # use_muon_clip: [true]
 
   # diff_topk_regularizer_max_coeff: [0.0001, 0.001]
   # diff_topk_regularizer_schedule: ['cosine', 'constant']

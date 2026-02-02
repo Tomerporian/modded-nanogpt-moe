@@ -39,9 +39,9 @@ class Muon(torch.optim.Optimizer):
     """
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
-                 backend='newtonschulz5', backend_steps=5):
+                 backend='newtonschulz5', backend_steps=5, weight_decay=0.0):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
-                        backend=backend, backend_steps=backend_steps)
+                        backend=backend, backend_steps=backend_steps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
     def step(self):
@@ -49,6 +49,7 @@ class Muon(torch.optim.Optimizer):
             lr = group['lr']
             momentum = group['momentum']
             zeropower_backend = zeropower_backends[group['backend']]
+            weight_decay = group['weight_decay']
 
             total_params = sum(p.numel() for p in group['params'])
             updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
@@ -73,6 +74,8 @@ class Muon(torch.optim.Optimizer):
 
             curr_idx = 0
             for p in group['params']:
+                if weight_decay != 0.0:
+                    p.data.mul_(1.0 - lr * weight_decay)
                 g = updates_flat[curr_idx:curr_idx + p.numel()].view_as(p.data).type_as(p.data)
                 p.data.add_(g, alpha=-lr)
                 curr_idx += p.numel()
@@ -181,14 +184,16 @@ def get_optimizers(raw_model, args):
         [raw_model.transformer.wte.weight],
         lr=args.lr_embed,
         betas=adamw_betas,
-        weight_decay=args.weight_decay,
+        # weight_decay=args.weight_decay,
+        weight_decay=0,
         fused=adamw_fused,
     )
     optimizer2 = torch.optim.AdamW(
         [raw_model.lm_head.weight],
         lr=args.lr_head,
         betas=adamw_betas,
-        weight_decay=args.weight_decay,
+        # weight_decay=args.weight_decay,
+        weight_decay=0,
         fused=adamw_fused,
     )
 
@@ -211,9 +216,9 @@ def get_optimizers(raw_model, args):
         backend=args.muon_svd_backend,
         nesterov=args.muon_nesterov,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.weight_decay
     )
     if muon_cls is MuonClip:
-        muon_kwargs["weight_decay"] = args.weight_decay
         muon_kwargs["update_scale"] = args.muon_update_scale
 
     if args.only_router_muon:

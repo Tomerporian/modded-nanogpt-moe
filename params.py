@@ -48,6 +48,9 @@ def _build_training_parser():
                        choices=['swiglu','geglu', 'reglu'])
     group.add_argument('--router-activation', default='gelu', type=str, choices=['gelu', 'relu', 'relu_squared'],
                        help='activation to use between router MLP layers (if depth > 1)')
+    group.add_argument('--topk-activation', default='softmax', type=str,
+                       choices=['softmax', 'sigmoid'],
+                       help='activation used for selecting router top-k experts')
     group.add_argument('--global-load-balance', action='store_true', default=False,
                        help='enable global batch load balancing for auxiliary router loss')
     group.add_argument('--aux-use-routed-prob', action='store_true', default=False,

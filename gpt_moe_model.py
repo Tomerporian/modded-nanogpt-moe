@@ -150,40 +150,58 @@ class MLP(nn.Module):
         return x
 
 
-def switch_topk(logits, k, null_expert_bias=0.0, weight_logits=None, probs_override=None):
+def _apply_switch_activation(values, activation, dim=-1):
+    if activation == 'softmax':
+        return F.softmax(values, dim=dim)
+    if activation == 'sigmoid':
+        return torch.sigmoid(values)
+    raise ValueError(f"Unsupported top-k activation: {activation}")
+
+
+def _normalize_gate(weights, eps=1e-9):
+    denom = torch.clamp(weights.sum(dim=-1, keepdim=True), min=eps)
+    return weights / denom
+
+
+def switch_topk(logits, k, weight_logits=None, activation='softmax'):
     """Switch/Top-k. Returns (indices, probs, expert output weights)."""
-    probs_from_logits = logits.softmax(dim=-1)
-    probs = probs_override if probs_override is not None else probs_from_logits
+    probs_from_logits = _apply_switch_activation(logits, activation)
     gate_vals, topk_idx = torch.topk(probs_from_logits, k, dim=-1)
-    if weight_logits is None:
-        gate = gate_vals / (gate_vals.sum(dim=-1, keepdim=True) + null_expert_bias)
-    else:
+    if weight_logits is not None:
         topk_logits = torch.gather(weight_logits, dim=-1, index=topk_idx)
-        gate = F.softmax(topk_logits, dim=-1)
+        gate_vals = _apply_switch_activation(topk_logits, activation)
+
+    gate = _normalize_gate(gate_vals)
     # Routed probabilities reflect the actual mixture used in the forward pass
-    routed_probs = torch.zeros_like(probs)
+    routed_probs = torch.zeros_like(probs_from_logits, dtype=gate.dtype)
     routed_probs.scatter_(dim=-1, index=topk_idx, src=gate)
     return topk_idx, routed_probs, gate
 
 
-def hash_select(token_ids, num_experts, null_expert_bias=0.0):
+def hash_select(token_ids, num_experts):
     expert_idx = (token_ids[..., None].float() % num_experts).to(token_ids.dtype)
     routing_weights = torch.nn.functional.one_hot(expert_idx, num_classes=num_experts)
     selected_prob, selected_expert = torch.max(routing_weights, dim=-1, keepdim=True)
     expert_mask = torch.nn.functional.one_hot(torch.argmax(routing_weights, dim=-1), num_classes=num_experts)
-    if null_expert_bias > 0:
-        selected_prob = selected_prob / (selected_prob + null_expert_bias)
     return selected_expert, routing_weights, selected_prob
 
 
-def diff_routing(logits, k):
-    z_max = torch.max(logits, dim=-1, keepdim=True).values
-    exp_z = torch.exp(logits - z_max)
-    num_experts = exp_z.shape[-1]
+def diff_routing(logits, k, activation='softmax'):
+    num_experts = logits.shape[-1]
     kth_smallest_idx = num_experts - k
-    m_exp_z = torch.kthvalue(exp_z, k=kth_smallest_idx, dim=-1, keepdim=True).values
-    topk_exp_z = F.relu(exp_z - m_exp_z)
-    topk_weights = topk_exp_z / (topk_exp_z.sum(dim=-1, keepdim=True) + 1e-8)
+    
+    if activation == 'softmax':
+        z_max = torch.max(logits, dim=-1, keepdim=True).values
+        exp_z = torch.exp(logits - z_max)
+        m_exp_z = torch.kthvalue(exp_z, k=kth_smallest_idx, dim=-1, keepdim=True).values
+        topk_exp_z = F.relu(exp_z - m_exp_z)
+        activated = topk_exp_z
+    elif activation == 'sigmoid':
+        m_logits = torch.kthvalue(logits, k=kth_smallest_idx, dim=-1, keepdim=True).values
+        activated = F.relu(2 * torch.sigmoid(logits - m_logits) - 1)
+    else:
+        raise ValueError(f"Unsupported top-k activation for diff routing: {activation}")
+    topk_weights = activated / (activated.sum(dim=-1, keepdim=True) + 1e-8)
     # Get indices of top-k for compatibility
     gate, topk_idx = torch.topk(topk_weights, k, dim=-1)
     return topk_idx, topk_weights, gate
@@ -198,13 +216,23 @@ def diff_no_softmax(logits, k):
     gate, topk_idx = torch.topk(topk_weights, k, dim=-1)
     return topk_idx, topk_weights, gate
 
-def diff_no_softmax_to_switch_transistion(logits, k, diff_weight, null_expert_bias=0.0, weight_logits=None, probs_override=None):
+def diff_no_softmax_to_switch_transistion(logits, k, diff_weight, weight_logits=None, topk_activation='softmax'):
     if diff_weight == 0:
-        return switch_topk(logits, k, null_expert_bias=null_expert_bias, weight_logits=weight_logits, probs_override=probs_override)
+        return switch_topk(
+            logits,
+            k,
+            weight_logits=weight_logits,
+            activation=topk_activation,
+        )
     if diff_weight == 1:
         return diff_no_softmax(logits, k)
 
-    topk_idx, switch_routed_probs, switch_gate = switch_topk(logits, k, null_expert_bias=null_expert_bias, weight_logits=weight_logits, probs_override=probs_override)
+    topk_idx, switch_routed_probs, switch_gate = switch_topk(
+        logits,
+        k,
+        weight_logits=weight_logits,
+        activation=topk_activation,
+    )
     topk_idx, diff_routed_probs, diff_gate = diff_no_softmax(logits, k)
     routed_probs = diff_weight * diff_routed_probs + (1 - diff_weight) * switch_routed_probs
     gate = diff_weight * diff_gate + (1 - diff_weight) * switch_gate
@@ -269,6 +297,7 @@ class MoE(nn.Module):
         self.router_depth = config.router_depth
         self.router_layer_type = config.router_layer_type
         self.router_activation = config.router_activation
+        self.topk_activation = config.topk_activation
         self.global_load_balance = config.global_load_balance
         self.layer_idx = layer_idx
         self.loss_free_mode = config.loss_free_mode
@@ -294,6 +323,7 @@ class MoE(nn.Module):
         assert self.router_type in ('hash', 'switch', 'diff', 'diff_no_softmax', 'scaled_diff_no_softmax')
         assert self.router_activation in ('gelu', 'relu', 'relu_squared')
         assert self.loss_free_mode in ('none', 'deepseek', 'stopgrad')
+        assert self.topk_activation  in ('softmax', 'sigmoid'), "Unsupported top-k activation: {self.topk_activation}"
         assert self.router_logit_jitter >= 0.0, "router_logit_jitter must be non-negative"
         if self.router_type == 'hash' and self.loss_free_mode != 'none':
             raise ValueError("Loss-free load balancing requires a learned router (switch or diff).")
@@ -332,8 +362,6 @@ class MoE(nn.Module):
                 self.router_scaler.weight.zero_()
 
     def _get_router_temperature(self, reference_tensor):
-        if not self.use_router_temperature or self.router_temperature_log is None:
-            return None
         temperature = torch.exp(self.router_temperature_log)
         if reference_tensor is not None:
             temperature = temperature.to(dtype=reference_tensor.dtype, device=reference_tensor.device)
@@ -521,21 +549,32 @@ class MoE(nn.Module):
             logits = logits_for_selection
 
         if self.router_type == "switch":
-            router_probs = logits.softmax(dim=-1)
             topk_idx, routed_probs_for_aux, gate = switch_topk(
                 logits_for_selection,
                 self.top_k,
                 weight_logits=logits,
-                probs_override=router_probs,
+                activation=self.topk_activation,
             )
-            probs = router_probs
+            
+            unnorm_probs = _apply_switch_activation(logits_for_selection, self.topk_activation)
+            probs = _normalize_gate(unnorm_probs)
+            # probs = logits.softmax(dim=-1)
+            
         elif self.router_type == "diff":
-            topk_idx, routed_probs_for_aux, gate = diff_routing(logits_for_selection, self.top_k)
+            topk_idx, routed_probs_for_aux, gate = diff_routing(
+                logits_for_selection,
+                self.top_k,
+                activation=self.topk_activation,
+            )
             probs = logits.softmax(dim=-1)
         elif self.router_type == "diff_no_softmax":
             # topk_idx, routed_probs_for_aux, gate = diff_no_softmax(logits_for_selection, self.top_k)
             topk_idx, routed_probs_for_aux, gate = diff_no_softmax_to_switch_transistion(
-                logits_for_selection, self.top_k, diff_weight=diff_weight)
+                logits_for_selection,
+                self.top_k,
+                diff_weight=diff_weight,
+                topk_activation=self.topk_activation,
+            )
             probs = logits.softmax(dim=-1)
         elif self.router_type == 'scaled_diff_no_softmax':
             scalers = self.router_scaler(x)
@@ -632,7 +671,7 @@ class MoE(nn.Module):
             if self.aux_use_routed_prob:
                 probs_full = routed_probs_for_aux.reshape(-1, self.num_experts)
             else:
-                probs_full = logits.softmax(dim=-1).reshape(-1, self.num_experts)
+                probs_full = probs.reshape(-1, self.num_experts)
             frac_for_aux = global_frac_override if global_frac_override is not None else frac
             probs_mean = probs_full.mean(0)
             aux = self.num_experts * (frac_for_aux * probs_mean).sum()
@@ -708,6 +747,7 @@ class GPTConfig:
     router_depth : int = 1
     router_layer_type : str = None
     router_activation : str = 'gelu'
+    topk_activation : str = 'softmax'
     global_load_balance : bool = False
     aux_use_routed_prob : bool = False
     loss_free_mode : str = 'none'

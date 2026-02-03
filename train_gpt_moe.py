@@ -140,6 +140,7 @@ model = GPT(GPTConfig(
     router_depth=args.router_depth,
     router_layer_type=args.router_layer_type,
     router_activation=args.router_activation,
+    topk_activation=args.topk_activation,
     global_load_balance=args.global_load_balance,
     aux_use_routed_prob=args.aux_use_routed_prob,
     loss_free_mode=args.loss_free_mode,

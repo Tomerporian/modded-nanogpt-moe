@@ -130,6 +130,24 @@ def _build_training_parser():
     group.add_argument('--min-lr', default=0.1, type=float,
                     help='Min LR value after decay. Works only for inverse')
 
+    # Model averaging (SWA) parameters
+    group = parser.add_argument_group('Averaging parameters')
+    group.add_argument('--use-swa', action='store_true', default=False,
+                       help='enable Stochastic Weight Averaging (SWA)')
+    group.add_argument('--swa-start', default=0, type=int,
+                       help='iteration to start SWA parameter averaging (inclusive)')
+    group.add_argument('--swa-cadence', default=1, type=int,
+                       help='update SWA averages every N steps once started')
+    group.add_argument('--swa-eval-final', action='store_true', default=False,
+                       help='at the very end, run one validation pass using SWA weights and log it')
+    group.add_argument('--swa-eval-during-val', action='store_true', default=False,
+                       help='evaluate SWA model alongside regular validation using the same batches')
+    group.add_argument('--swa-avg-type', default='uniform', type=str,
+                       choices=['uniform', 'ema'],
+                       help='averaging rule for SWA parameters: uniform (default) or EMA')
+    group.add_argument('--swa-ema-decay', default=0.99, type=float,
+                       help='EMA decay for SWA when --swa-avg-type=ema')
+
     # Evaluation and logging parameters
     group = parser.add_argument_group('Evaluation and logging parameters')
     group.add_argument('--val-loss-every', default=125, type=int,

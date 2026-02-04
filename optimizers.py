@@ -49,7 +49,7 @@ class Muon(torch.optim.Optimizer):
             lr = group['lr']
             momentum = group['momentum']
             zeropower_backend = zeropower_backends[group['backend']]
-            weight_decay = group['weight_decay']
+            weight_decay = getattr(group, 'weight_decay', 0)
 
             total_params = sum(p.numel() for p in group['params'])
             updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)

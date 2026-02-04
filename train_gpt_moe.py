@@ -28,6 +28,7 @@ from wandb_logging import init_wandb, wandb_train_log, wandb_val_log
 from params import parse_args
 from optimizers import get_optimizers
 from schedulers import SCHEDULER_TYPE
+from torch.optim.swa_utils import AveragedModel
 from logger import setup_default_logging
 from data.dataloaders import create_dataloader
 from gpt_moe_model import (
@@ -181,6 +182,33 @@ ctx = torch.amp.autocast(device_type='cuda', dtype=DTYPES[args.ops_dtype])
 # init the optimizer(s)
 optimizers, router_optimizer, router_temperature_optimizer = get_optimizers(raw_model, args)
 
+# Initialize SWA averaged model if requested
+swa_model = None
+# If SWA is enabled, set default swa_start to the former decay phase start,
+# and disable warmdown to keep a constant LR after warmup
+if args.use_swa:
+    if getattr(args, 'swa_start', 0) <= 0 and getattr(args, 'warmdown_iters', 0) > 0:
+        args.swa_start = max(0, args.num_iterations - args.warmdown_iters)
+        logging.info(f"SWA enabled; defaulting swa_start to {args.swa_start} (start of previous warmdown phase).")
+    if getattr(args, 'warmdown_iters', 0) > 0:
+        logging.info(f"SWA enabled; overriding warmdown_iters={args.warmdown_iters} to 0 for constant LR.")
+        args.warmdown_iters = 0
+
+    # Choose averaging function (uniform vs EMA)
+    avg_fn = None
+    if getattr(args, 'swa_avg_type', 'uniform') == 'ema':
+        decay = float(getattr(args, 'swa_ema_decay', 0.99))
+        def _ema_avg_fn(avg_param, param, n):
+            # avg_param and param share dtype/device; EMA ignores n
+            return avg_param.mul(decay).add(param, alpha=1.0 - decay)
+        avg_fn = _ema_avg_fn
+        logging.info(f"Using EMA averaging for SWA with decay={decay}")
+    swa_model = AveragedModel(raw_model, avg_fn=avg_fn)
+    swa_model.to(device)
+    # Compile SWA model to reduce eval overhead when requested
+    if getattr(args, 'swa_eval_during_val', False) or getattr(args, 'swa_eval_final', False):
+        swa_model = torch.compile(swa_model)
+
 # init the scheduler(s)
 scheduler_type = SCHEDULER_TYPE[args.lr_scheduler]
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, lambda it: scheduler_type(args, it, min_lr=args.min_lr)) for opt in optimizers]
@@ -220,6 +248,13 @@ if args.resume:
         checkpoint_schedulers = checkpoint.get('schedulers', [])
         for sched, state in zip(schedulers, checkpoint_schedulers):
             sched.load_state_dict(state)
+        # If present, restore SWA model state
+        if args.use_swa and 'swa_model' in checkpoint and swa_model is not None:
+            try:
+                swa_model.load_state_dict(checkpoint['swa_model'])
+                logging.info("Loaded SWA state from checkpoint.")
+            except Exception as e:
+                logging.warning(f"Failed to load SWA state from checkpoint: {e}")
         start_step = checkpoint.get('step', 0) + 1
         start_step = min(start_step, args.num_iterations)
         resume_training_time_ms = checkpoint.get('training_time_ms', 0.0)
@@ -332,6 +367,8 @@ for step in range(start_step, args.num_iterations + 1):
         training_time_ms += 1000 * (time.time() - t0)
         # run validation batches
         model.eval()
+        if args.use_swa and args.swa_eval_during_val and swa_model is not None:
+            swa_model.eval()
         val_loss = 0.0
         val_ce_loss = 0.0
         val_aux_loss = 0.0
@@ -345,6 +382,15 @@ for step in range(start_step, args.num_iterations + 1):
         val_layer_expert_balance = torch.zeros(n_layers, num_experts, device=device)
         val_layer_router_values = init_layer_router_value_tensors(n_layers, device=device)
         val_total_router_values = init_total_router_value_tensors(device=device)
+        # Optional SWA accumulators (only if evaluating during val)
+        do_swa_val = args.use_swa and args.swa_eval_during_val and swa_model is not None and step >= args.swa_start
+        if do_swa_val:
+            swa_val_loss = torch.tensor(0.0, device=device)
+            swa_val_ce_loss = torch.tensor(0.0, device=device)
+            swa_val_aux_loss = torch.tensor(0.0, device=device)
+            swa_val_theta_lb_loss = torch.tensor(0.0, device=device)
+            swa_val_diff_topk_reg = torch.tensor(0.0, device=device)
+
         for _ in range(val_steps):
             x_val, y_val = val_loader.next_batch()
             with torch.no_grad():
@@ -383,16 +429,53 @@ for step in range(start_step, args.num_iterations + 1):
                         val_layer_router_values[key] = val_layer_router_values[key] + layer_router_values[key].detach()
                         val_total_router_values[key] = val_total_router_values[key] + total_router_values[key].detach()
                     del loss, ce_loss
+            # Evaluate SWA on the same batch if requested and averaging has begun
+            if do_swa_val and getattr(swa_model, 'n_averaged', 0) > 0:
+                with torch.no_grad():
+                    with ctx:
+                        (
+                            _,
+                            loss,
+                            ce_loss,
+                            total_aux,
+                            total_diff_topk_reg,
+                            total_theta_lb,
+                            *_
+                        ) = swa_model(
+                            x_val,
+                            y_val,
+                            return_logits=False,
+                            aux_coeff=args.aux_coeff_val,
+                            diff_topk_reg_coeff=diff_topk_reg_coeff,
+                            diff_weight=diff_weight
+                        )
+                        swa_val_loss += loss.detach()
+                        swa_val_ce_loss += ce_loss.detach()
+                        swa_val_aux_loss += total_aux.detach()
+                        swa_val_theta_lb_loss += total_theta_lb.detach()
+                        swa_val_diff_topk_reg += total_diff_topk_reg.detach()
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         dist.all_reduce(val_ce_loss, op=dist.ReduceOp.AVG)
         dist.all_reduce(val_aux_loss, op=dist.ReduceOp.AVG)
         dist.all_reduce(val_theta_lb_loss, op=dist.ReduceOp.AVG)
         dist.all_reduce(val_diff_topk_reg, op=dist.ReduceOp.AVG)
+        if do_swa_val and getattr(swa_model, 'n_averaged', 0) > 0:
+            dist.all_reduce(swa_val_loss, op=dist.ReduceOp.AVG)
+            dist.all_reduce(swa_val_ce_loss, op=dist.ReduceOp.AVG)
+            dist.all_reduce(swa_val_aux_loss, op=dist.ReduceOp.AVG)
+            dist.all_reduce(swa_val_theta_lb_loss, op=dist.ReduceOp.AVG)
+            dist.all_reduce(swa_val_diff_topk_reg, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         val_ce_loss /= val_steps
         val_aux_loss /= val_steps
         val_theta_lb_loss /= val_steps
         val_diff_topk_reg /= val_steps
+        if do_swa_val and getattr(swa_model, 'n_averaged', 0) > 0:
+            swa_val_loss /= val_steps
+            swa_val_ce_loss /= val_steps
+            swa_val_aux_loss /= val_steps
+            swa_val_theta_lb_loss /= val_steps
+            swa_val_diff_topk_reg /= val_steps
         # average and all-reduce router stats
         val_router_entropy = val_router_entropy / val_steps
         val_expert_balance = val_expert_balance / val_steps
@@ -413,6 +496,14 @@ for step in range(start_step, args.num_iterations + 1):
             logging.info(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
             with open(logfile, "a") as f:
                 f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+            if do_swa_val and getattr(swa_model, 'n_averaged', 0) > 0:
+                wandb.log({
+                    'swa/val/loss': float(swa_val_loss.item()),
+                    'swa/val/ce_loss': float(swa_val_ce_loss.item()),
+                    'swa/val/aux_loss': float(swa_val_aux_loss.item()),
+                    'swa/val/theta_lb_loss': float(swa_val_theta_lb_loss.item()),
+                    'swa/val/diff_topk_reg': float(swa_val_diff_topk_reg.item()),
+                }, step=step)
         # compute router grad norms (CE and AUX separately) occasionally at validation interval
         # Use a single micro-batch to avoid heavy cost
         model.train()
@@ -558,6 +649,11 @@ for step in range(start_step, args.num_iterations + 1):
             schedulers=[sched.state_dict() for sched in schedulers],
             training_time_ms=training_time_ms,
         )
+        if args.use_swa and swa_model is not None:
+            try:
+                log['swa_model'] = swa_model.state_dict()
+            except Exception as e:
+                logging.warning(f"Failed to serialize SWA state: {e}")
         checkpoint_path = os.path.join(args.output, f'state_step{step:06d}.pt')
         torch.save(log, checkpoint_path)
         if args.save_only_latest and (last_step or args.save_every > 0):
@@ -685,6 +781,10 @@ for step in range(start_step, args.num_iterations + 1):
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
         sched.step()
+    # Update SWA parameters if enabled and within schedule
+    if args.use_swa and swa_model is not None:
+        if step >= args.swa_start and (args.swa_cadence <= 1 or ((step - args.swa_start) % args.swa_cadence) == 0):
+            swa_model.update_parameters(raw_model)
     if args.qk_clip_tau > 0.0:
         raw_model.apply_qk_clip()
 
@@ -749,6 +849,66 @@ for step in range(start_step, args.num_iterations + 1):
         )
     if args.log_attn_logits:
         raw_model.reset_attn_logit_max()
+
+# Optional final SWA evaluation (no LR decay, averaged weights)
+if args.use_swa and args.swa_eval_final and swa_model is not None:
+    try:
+        torch.cuda.synchronize()
+        swa_model.eval()
+        val_loss = torch.tensor(0.0, device=device)
+        val_ce_loss = torch.tensor(0.0, device=device)
+        val_aux_loss = torch.tensor(0.0, device=device)
+        val_theta_lb_loss = torch.tensor(0.0, device=device)
+        val_diff_topk_reg = torch.tensor(0.0, device=device)
+        for _ in range(val_steps):
+            x_val, y_val = val_loader.next_batch()
+            with torch.no_grad():
+                with ctx:
+                    (
+                        _,
+                        loss,
+                        ce_loss,
+                        total_aux,
+                        total_diff_topk_reg,
+                        total_theta_lb,
+                        *_
+                    ) = swa_model(
+                        x_val,
+                        y_val,
+                        return_logits=False,
+                        aux_coeff=args.aux_coeff_val,
+                        diff_topk_reg_coeff=get_diff_topk_reg_coeff(args.num_iterations),
+                        diff_weight=1.0,
+                    )
+                    val_loss += loss.detach()
+                    val_ce_loss += ce_loss.detach()
+                    val_aux_loss += total_aux.detach()
+                    val_theta_lb_loss += total_theta_lb.detach()
+                    val_diff_topk_reg += total_diff_topk_reg.detach()
+        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        dist.all_reduce(val_ce_loss, op=dist.ReduceOp.AVG)
+        dist.all_reduce(val_aux_loss, op=dist.ReduceOp.AVG)
+        dist.all_reduce(val_theta_lb_loss, op=dist.ReduceOp.AVG)
+        dist.all_reduce(val_diff_topk_reg, op=dist.ReduceOp.AVG)
+        val_loss /= val_steps
+        val_ce_loss /= val_steps
+        val_aux_loss /= val_steps
+        val_theta_lb_loss /= val_steps
+        val_diff_topk_reg /= val_steps
+        if master_process:
+            wandb.log({
+                'swa/val/loss': float(val_loss.item()),
+                'swa/val/ce_loss': float(val_ce_loss.item()),
+                'swa/val/aux_loss': float(val_aux_loss.item()),
+                'swa/val/theta_lb_loss': float(val_theta_lb_loss.item()),
+                'swa/val/diff_topk_reg': float(val_diff_topk_reg.item()),
+            }, step=args.num_iterations)
+            logging.info(
+                f"SWA final eval — loss:{val_loss.item():.4f} ce:{val_ce_loss.item():.4f} aux:{val_aux_loss.item():.4f}"
+            )
+    except Exception as e:
+        if master_process:
+            logging.warning(f"SWA final evaluation failed: {e}")
 
 if master_process:
     logging.info(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")

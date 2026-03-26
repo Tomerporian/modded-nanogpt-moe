@@ -51,6 +51,8 @@ def _build_training_parser():
     group.add_argument('--topk-activation', default='softmax', type=str,
                        choices=['softmax', 'sigmoid'],
                        help='activation used for selecting router top-k experts')
+    group.add_argument('--topk-ste-width', default=0.0, type=float,
+                       help='STE rectangle width (in logit units) used to send router gradients to near-boundary experts; 0 disables the STE correction')
     group.add_argument('--global-load-balance', action='store_true', default=False,
                        help='enable global batch load balancing for auxiliary router loss')
     group.add_argument('--aux-use-routed-prob', action='store_true', default=False,

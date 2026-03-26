@@ -47,6 +47,12 @@ def log_router_values(layer_router_values_avg, total_router_values_avg, router_v
     log = {}
     n_layers = next(iter(layer_router_values_avg.values())).size(0)
     for key in router_value_keys:
+        if key.startswith('ste_'):
+            metric_name = key[len('ste_'):]
+            for li in range(n_layers):
+                log[f'ste/layer_{li}/{metric_name}'] = float(layer_router_values_avg[key][li].item())
+            log[f'ste/all_layers/{metric_name}'] = float(total_router_values_avg[key].item())
+            continue
         for li in range(n_layers):
             log[f'router_values/layer_{li}_{key}'] = float(layer_router_values_avg[key][li].item())
         log[f'router_values/total_{key}'] = float(total_router_values_avg[key].item())

@@ -15,6 +15,10 @@ ROUTER_VALUE_KEYS = (
     'top1_coef',
     'top2_coef',
     'coef_diff',
+    'ste_active_token_frac',
+    'ste_extra_experts_per_token',
+    'ste_boundary_gap',
+    'ste_support_prob_mass',
     'max_scaler',
     'min_scaler'
 )
@@ -163,19 +167,70 @@ def _normalize_gate(weights, eps=1e-9):
     return weights / denom
 
 
-def switch_topk(logits, k, weight_logits=None, activation='softmax'):
-    """Switch/Top-k. Returns (indices, probs, expert output weights)."""
-    probs_from_logits = _apply_switch_activation(logits, activation)
-    gate_vals, topk_idx = torch.topk(probs_from_logits, k, dim=-1)
-    if weight_logits is not None:
-        topk_logits = torch.gather(weight_logits, dim=-1, index=topk_idx)
-        gate_vals = _apply_switch_activation(topk_logits, activation)
+class RectIndicatorSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, margin, bandwidth):
+        ctx.bandwidth = float(bandwidth)
+        ctx.save_for_backward(margin)
+        return (margin >= 0).to(dtype=margin.dtype)
 
-    gate = _normalize_gate(gate_vals)
-    # Routed probabilities reflect the actual mixture used in the forward pass
-    routed_probs = torch.zeros_like(probs_from_logits, dtype=gate.dtype)
-    routed_probs.scatter_(dim=-1, index=topk_idx, src=gate)
+    @staticmethod
+    def backward(ctx, grad_output):
+        (margin,) = ctx.saved_tensors
+        half_width = ctx.bandwidth * 0.5
+        window = (margin.float().abs() < half_width).to(dtype=torch.float32)
+        grad_margin = grad_output.float() * window / ctx.bandwidth
+        return grad_margin.to(dtype=margin.dtype), None
+
+
+def _hard_topk_mask(reference, topk_idx):
+    mask = torch.zeros_like(reference)
+    mask.scatter_(dim=-1, index=topk_idx, value=1.0)
+    return mask
+
+
+def _ste_support_mask(logits, topk_idx, bandwidth):
+    threshold = torch.gather(logits, dim=-1, index=topk_idx).min(dim=-1, keepdim=True).values
+    return (logits - threshold).abs() < (bandwidth * 0.5)
+
+
+def _switch_topk_common(logits, topk_idx, weight_logits=None, activation='softmax', mask=None):
+    weight_probs = _apply_switch_activation(weight_logits, activation) if weight_logits is not None else _apply_switch_activation(logits, activation)
+    selected_weights = weight_probs * mask.to(weight_probs.dtype)
+    routed_probs = _normalize_gate(selected_weights)
+    gate = torch.gather(routed_probs, dim=-1, index=topk_idx)
     return topk_idx, routed_probs, gate
+
+
+def _soft_support_routed_probs(logits, topk_idx, weight_logits=None, activation='softmax', bandwidth=0.0):
+    weight_probs = _apply_switch_activation(weight_logits, activation) if weight_logits is not None else _apply_switch_activation(logits, activation)
+    threshold = torch.gather(logits, dim=-1, index=topk_idx).min(dim=-1, keepdim=True).values
+    soft_mask = ((logits - threshold).abs() < (bandwidth * 0.5)).to(dtype=weight_probs.dtype)
+    return _normalize_gate(weight_probs * soft_mask)
+
+
+def switch_topk(logits, k, weight_logits=None, activation='softmax', ste_width=0.0):
+    """Switch/Top-k with optional rectangular STE around the top-k boundary."""
+    probs_from_logits = _apply_switch_activation(logits, activation)
+    topk_idx = torch.topk(probs_from_logits, k, dim=-1).indices
+    hard_mask = _hard_topk_mask(logits, topk_idx)
+
+    if 0.0 < ste_width:
+        selected_logits = torch.gather(logits, dim=-1, index=topk_idx)
+        threshold = selected_logits.min(dim=-1, keepdim=True).values
+        margin = logits - threshold
+        soft_mask = RectIndicatorSTE.apply(margin, ste_width)
+        mask = hard_mask + soft_mask - soft_mask.detach()
+    else:
+        mask = hard_mask
+
+    return _switch_topk_common(
+        logits,
+        topk_idx,
+        weight_logits=weight_logits,
+        activation=activation,
+        mask=mask,
+    )
 
 
 def hash_select(token_ids, num_experts):
@@ -216,13 +271,21 @@ def diff_no_softmax(logits, k):
     gate, topk_idx = torch.topk(topk_weights, k, dim=-1)
     return topk_idx, topk_weights, gate
 
-def diff_no_softmax_to_switch_transistion(logits, k, diff_weight, weight_logits=None, topk_activation='softmax'):
+def diff_no_softmax_to_switch_transistion(
+    logits,
+    k,
+    diff_weight,
+    weight_logits=None,
+    topk_activation='softmax',
+    ste_width=0.0,
+):
     if diff_weight == 0:
         return switch_topk(
             logits,
             k,
             weight_logits=weight_logits,
             activation=topk_activation,
+            ste_width=ste_width,
         )
     if diff_weight == 1:
         return diff_no_softmax(logits, k)
@@ -232,6 +295,7 @@ def diff_no_softmax_to_switch_transistion(logits, k, diff_weight, weight_logits=
         k,
         weight_logits=weight_logits,
         activation=topk_activation,
+        ste_width=ste_width,
     )
     topk_idx, diff_routed_probs, diff_gate = diff_no_softmax(logits, k)
     routed_probs = diff_weight * diff_routed_probs + (1 - diff_weight) * switch_routed_probs
@@ -298,6 +362,7 @@ class MoE(nn.Module):
         self.router_layer_type = config.router_layer_type
         self.router_activation = config.router_activation
         self.topk_activation = config.topk_activation
+        self.topk_ste_width = config.topk_ste_width
         self.global_load_balance = config.global_load_balance
         self.layer_idx = layer_idx
         self.loss_free_mode = config.loss_free_mode
@@ -554,6 +619,7 @@ class MoE(nn.Module):
                 self.top_k,
                 weight_logits=logits,
                 activation=self.topk_activation,
+                ste_width=self.topk_ste_width,
             )
             
             unnorm_probs = _apply_switch_activation(logits_for_selection, self.topk_activation)
@@ -574,6 +640,7 @@ class MoE(nn.Module):
                 self.top_k,
                 diff_weight=diff_weight,
                 topk_activation=self.topk_activation,
+                ste_width=self.topk_ste_width,
             )
             probs = logits.softmax(dim=-1)
         elif self.router_type == 'scaled_diff_no_softmax':
@@ -587,10 +654,27 @@ class MoE(nn.Module):
         BT      = B * T
         x_flat  = x.reshape(BT, C)
         y_flat  = torch.zeros_like(x_flat)
+        router_ste_y_flat = torch.zeros_like(x_flat)
 
         probs_flat = probs.reshape(BT, -1)
+        routed_probs_flat = routed_probs_for_aux.reshape(BT, self.num_experts)
         gate_flat = gate.reshape(BT, self.top_k)  # Now always (BT, k)
         idx_flat = topk_idx.reshape(BT, self.top_k)
+        logits_flat_for_stats = logits_for_selection.reshape(BT, self.num_experts).float()
+        extra_support_flat = None
+        ste_soft_routed_probs_flat = None
+        if self.topk_ste_width > 0.0:
+            hard_mask_flat = _hard_topk_mask(logits_flat_for_stats, idx_flat).bool()
+            support_mask_flat = _ste_support_mask(logits_flat_for_stats, idx_flat, self.topk_ste_width)
+            extra_support_flat = support_mask_flat & ~hard_mask_flat
+            ste_soft_routed_probs_flat = _soft_support_routed_probs(
+                logits_for_selection.reshape(BT, self.num_experts),
+                idx_flat,
+                weight_logits=logits.reshape(BT, self.num_experts),
+                activation=self.topk_activation,
+                bandwidth=self.topk_ste_width,
+            )
+
         for expert_id in range(self.num_experts):
             sel_mask = (idx_flat == expert_id)
             token_rows, which_k = torch.nonzero(sel_mask, as_tuple=True)
@@ -598,8 +682,15 @@ class MoE(nn.Module):
             out   = self.experts[expert_id](inp)
             coeff = gate_flat[token_rows, which_k].unsqueeze(1)
             y_flat.index_add_(0, token_rows, out * coeff)
+            if extra_support_flat is not None:
+                extra_rows = torch.nonzero(extra_support_flat[:, expert_id], as_tuple=False).flatten()
+                if extra_rows.numel() > 0:
+                    extra_inp = x_flat.index_select(0, extra_rows)
+                    extra_out = self.experts[expert_id](extra_inp).detach()
+                    extra_coeff = routed_probs_flat[extra_rows, expert_id].unsqueeze(1)
+                    router_ste_y_flat.index_add_(0, extra_rows, extra_out * extra_coeff)
 
-        y = y_flat.view_as(x)
+        y = (y_flat + router_ste_y_flat - router_ste_y_flat.detach()).view_as(x)
 
         with torch.no_grad():
             gate_stats = gate_flat.float()
@@ -609,14 +700,28 @@ class MoE(nn.Module):
             else:
                 top2_coef_vals = torch.zeros_like(top1_coef_vals)
 
-            logits_flat = logits_for_selection.reshape(BT, self.num_experts).float()
-            num_top_logits = 2 if logits_flat.size(1) >= 2 else 1
-            top_logits = torch.topk(logits_flat, k=num_top_logits, dim=-1).values
+            num_top_logits = 2 if logits_flat_for_stats.size(1) >= 2 else 1
+            top_logits = torch.topk(logits_flat_for_stats, k=num_top_logits, dim=-1).values
             top1_logits_vals = top_logits[:, 0]
             if num_top_logits == 2:
                 top2_logits_vals = top_logits[:, 1]
             else:
                 top2_logits_vals = torch.zeros_like(top1_logits_vals)
+
+            if extra_support_flat is None:
+                ste_active_token_frac = torch.tensor(0.0, device=x.device)
+                ste_extra_experts_per_token = torch.tensor(0.0, device=x.device)
+                ste_support_prob_mass = torch.tensor(0.0, device=x.device)
+            else:
+                ste_active_token_frac = extra_support_flat.any(dim=-1).float().mean()
+                ste_extra_experts_per_token = extra_support_flat.float().sum(dim=-1).mean()
+                ste_support_prob_mass = (ste_soft_routed_probs_flat * extra_support_flat.float()).sum(dim=-1).mean()
+
+            if self.num_experts > self.top_k:
+                topk_plus_one = torch.topk(logits_flat_for_stats, k=self.top_k + 1, dim=-1).values
+                ste_boundary_gap = (topk_plus_one[:, self.top_k - 1] - topk_plus_one[:, self.top_k]).mean()
+            else:
+                ste_boundary_gap = torch.tensor(0.0, device=x.device)
 
             router_value_stats = {
                 'top1_logit': top1_logits_vals.mean(),
@@ -625,6 +730,10 @@ class MoE(nn.Module):
                 'top1_coef': top1_coef_vals.mean(),
                 'top2_coef': top2_coef_vals.mean(),
                 'coef_diff': (top1_coef_vals - top2_coef_vals).mean(),
+                'ste_active_token_frac': ste_active_token_frac,
+                'ste_extra_experts_per_token': ste_extra_experts_per_token,
+                'ste_boundary_gap': ste_boundary_gap,
+                'ste_support_prob_mass': ste_support_prob_mass,
                 'max_scaler': torch.tensor(0, dtype=torch.float, device=x.device),
                 'min_scaler': torch.tensor(0, dtype=torch.float, device=x.device)
             }
@@ -760,6 +869,7 @@ class GPTConfig:
     theta_load_balance_coeff : float = 0.0
     theta_lb_detach_theta : bool = True
     theta_lb_detach_logits : bool = True
+    topk_ste_width : float = 0.0
     qk_clip_tau : float = 0.0
     qk_clip_block_size : int = 128
     log_attn_logits : bool = False

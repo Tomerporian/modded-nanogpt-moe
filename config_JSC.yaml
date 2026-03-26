@@ -1,5 +1,5 @@
 job_details:
-  name: router_glu_variants
+  name: rect_ste
   output_dir: logs/seeds_and_datasets
 
 parameters:
@@ -49,13 +49,16 @@ parameters:
   aux_coeff_train: [0.1]
   aux_coeff_val: [0.1]
 
-  LIST_ROUTER_TYPES:
-    - router_type: ['diff_no_softmax']
-      aux_use_routed_prob: [true]
-    - router_type: ['switch']
-      aux_use_routed_prob: [false]
+  router_type: ['switch']
+  aux_use_routed_prob: [false]
+  topk_ste_width: [0.0, 0.1, 0.5, 1.0, 2.0, 10.0]
+
+  # LIST_ROUTER_TYPES:
+  #   - router_type: ['diff_no_softmax']
+  #     aux_use_routed_prob: [true]
+
   
-  router_layer_type: ['swiglu', 'geglu', 'reglu']
+  # router_layer_type: ['swiglu', 'geglu', 'reglu']
 
   # lr_theta: [0.001, 0.01, 5.0]
   # theta_load_balance_coeff: [0.1]

@@ -45,13 +45,17 @@ parameters:
   device_0: [true]
   seed: [1000]
 
-  global_load_balance: [true]
-  aux_coeff_train: [0.1]
-  aux_coeff_val: [0.1]
+  LIST_AUX_COEFF:
+    - aux_coeff_train: [0.01]
+      aux_coeff_val: [0.01]
+    - aux_coeff_train: [0.1]
+      aux_coeff_val: [0.1]
 
   router_type: ['switch']
   aux_use_routed_prob: [false]
-  topk_ste_width: [0.0, 0.1, 0.5, 1.0, 2.0, 10.0]
+  # topk_ste_width: [0.0, 0.1, 0.5, 1.0, 2.0, 10.0]
+  global_load_balance: [true,false]
+  load_balance_ste_width: [0.0, 0.1, 0.5, 1.0, 2.0, 10.0]
 
   # LIST_ROUTER_TYPES:
   #   - router_type: ['diff_no_softmax']
@@ -68,9 +72,9 @@ parameters:
     - num_experts: [64]
       top_k: [16]
       hidden_dim_scale_factor: [0.5]
-    # - num_experts: [64]
-    #   top_k: [2]
-    #   hidden_dim_scale_factor: [0.5]
+    - num_experts: [64]
+      top_k: [2]
+      hidden_dim_scale_factor: [0.5]
 
     # - num_experts: [128]
     #   top_k: [32]

@@ -155,6 +155,7 @@ model = GPT(GPTConfig(
     theta_lb_detach_theta=args.theta_lb_detach_theta,
     theta_lb_detach_logits=args.theta_lb_detach_logits,
     topk_ste_width=args.topk_ste_width,
+    load_balance_ste_width=args.load_balance_ste_width,
     qk_clip_tau=args.qk_clip_tau,
     qk_clip_block_size=args.qk_clip_block_size,
     log_attn_logits=args.log_attn_logits,

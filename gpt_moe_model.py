@@ -170,6 +170,11 @@ def _normalize_gate(weights, eps=1e-9):
     return weights / denom
 
 
+def _maxvio_from_load(load_frac):
+    expected_frac = load_frac.new_tensor(1.0 / load_frac.numel())
+    return (torch.amax(load_frac) - expected_frac) / expected_frac
+
+
 class RectIndicatorSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, margin, bandwidth):
@@ -378,6 +383,7 @@ class MoE(nn.Module):
         self.router_logit_jitter = config.router_logit_jitter
         self.use_router_temperature = config.use_router_temperature
         self.aux_use_routed_prob = config.aux_use_routed_prob
+        self.maxvio_load_balance = config.maxvio_load_balance
         self.diff_topk_reg_fp32 = config.diff_topk_reg_fp32
         self.diff_topk_reg_enabled = config.diff_topk_reg_max_coeff > 0.0
         self.theta_load_balance_coeff = config.theta_load_balance_coeff
@@ -398,6 +404,8 @@ class MoE(nn.Module):
         assert self.topk_activation  in ('softmax', 'sigmoid'), "Unsupported top-k activation: {self.topk_activation}"
         assert self.router_logit_jitter >= 0.0, "router_logit_jitter must be non-negative"
         assert self.load_balance_ste_width >= 0.0, "load_balance_ste_width must be non-negative"
+        if self.maxvio_load_balance and self.theta_load_balance_coeff > 0.0:
+            raise ValueError("Direct MaxVio load balancing cannot be combined with theta load balancing.")
         if self.router_type == 'hash' and self.loss_free_mode != 'none':
             raise ValueError("Loss-free load balancing requires a learned router (switch or diff).")
         if self.loss_free_mode == 'deepseek' and self.router_type != 'switch':
@@ -801,23 +809,27 @@ class MoE(nn.Module):
             with torch.no_grad():
                 token_H = -(probs_flat * (probs_flat + eps).log()).sum(-1)
                 router_entropy = token_H.mean() / math.log(float(self.num_experts))
-            # Switch paper:  L_aux = E * <load,prob>
-            if self.aux_use_routed_prob:
-                probs_full = routed_probs_for_aux.reshape(-1, self.num_experts)
-            else:
-                probs_full = probs.reshape(-1, self.num_experts)
-            probs_mean = probs_full.mean(0)
+            frac_base = global_frac_override if global_frac_override is not None else frac
             if self.load_balance_ste_width > 0.0:
                 logits_flat_for_lb = logits_for_selection.reshape(BT, self.num_experts)
                 lb_threshold = _topk_threshold(logits_flat_for_lb, idx_flat)
                 lb_margin = logits_flat_for_lb - lb_threshold
                 lb_soft_mask = RectIndicatorSTE.apply(lb_margin, self.load_balance_ste_width)
                 lb_soft_frac = lb_soft_mask.float().mean(0) / float(self.top_k)
-                frac_base = global_frac_override if global_frac_override is not None else frac
                 frac_for_aux = frac_base + lb_soft_frac - lb_soft_frac.detach()
             else:
-                frac_for_aux = global_frac_override if global_frac_override is not None else frac
-            aux = self.num_experts * (frac_for_aux * probs_mean).sum()
+                frac_for_aux = frac_base
+
+            if self.maxvio_load_balance:
+                aux = _maxvio_from_load(frac_for_aux)
+            else:
+                # Switch paper:  L_aux = E * <load,prob>
+                if self.aux_use_routed_prob:
+                    probs_full = routed_probs_for_aux.reshape(-1, self.num_experts)
+                else:
+                    probs_full = probs.reshape(-1, self.num_experts)
+                probs_mean = probs_full.mean(0)
+                aux = self.num_experts * (frac_for_aux * probs_mean).sum()
 
         if return_expert_assignments:
             return (
@@ -893,6 +905,7 @@ class GPTConfig:
     topk_activation : str = 'softmax'
     global_load_balance : bool = False
     aux_use_routed_prob : bool = False
+    maxvio_load_balance : bool = False
     loss_free_mode : str = 'none'
     loss_free_strength : float = 1.0
     loss_free_update_rate : float = 0.001

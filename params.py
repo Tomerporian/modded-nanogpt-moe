@@ -177,6 +177,8 @@ def _build_training_parser():
                        help='auxiliary loss coefficient for training')
     group.add_argument('--aux-coeff-val', default=0.0, type=float,
                        help='auxiliary loss coefficient for validation')
+    group.add_argument('--maxvio-load-balance', action='store_true', default=False,
+                       help='replace the standard auxiliary load-balance loss with a direct MaxVio objective')
     group.add_argument('--diff-topk-regularizer-max-coeff', default=0.0, type=float,
                        help='maximum coefficient for the diff-topk normalization regularizer (0 disables it)')
     group.add_argument('--diff-topk-regularizer-schedule', default='constant', type=str,
@@ -225,6 +227,8 @@ def parse_args(argv=None):
         parser.error("--only-router-muon cannot be combined with --use_adamw_router")
     if args.only_router_muon and args.use_adamw_opt3:
         parser.error("--only-router-muon cannot be combined with --use_adamw_opt3")
+    if args.maxvio_load_balance and args.theta_load_balance_coeff > 0.0:
+        parser.error("--maxvio-load-balance cannot be combined with --theta-load-balance-coeff > 0")
 
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
     return args, args_text

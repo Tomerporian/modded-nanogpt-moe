@@ -144,6 +144,7 @@ model = GPT(GPTConfig(
     topk_activation=args.topk_activation,
     global_load_balance=args.global_load_balance,
     aux_use_routed_prob=args.aux_use_routed_prob,
+    maxvio_load_balance=args.maxvio_load_balance,
     loss_free_mode=args.loss_free_mode,
     loss_free_strength=args.loss_free_strength,
     loss_free_update_rate=args.loss_free_update_rate,

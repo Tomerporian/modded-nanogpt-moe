@@ -48,16 +48,19 @@ parameters:
   LIST_AUX_COEFF:
     - aux_coeff_train: [0.01]
       aux_coeff_val: [0.01]
-    - aux_coeff_train: [0.1]
-      aux_coeff_val: [0.1]
-    # - aux_coeff_train: [0.001]
-    #   aux_coeff_val: [0.001]
+      load_balance_ste_width: [2.0, 5.0, 10.0]
+    - aux_coeff_train: [0.001]
+      aux_coeff_val: [0.001]
+      load_balance_ste_width: [0.5, 1.0, 2.0, 5.0, 10.0]
+    - aux_coeff_train: [0.0001]
+      aux_coeff_val: [0.0001]
+      load_balance_ste_width: [0.5, 1.0, 2.0, 5.0, 10.0]
+
 
   router_type: ['switch']
   aux_use_routed_prob: [false]
   # topk_ste_width: [0.0, 0.1, 0.5, 1.0, 2.0, 10.0]
   global_load_balance: [true,false]
-  load_balance_ste_width: [0.01, 0.1, 0.5, 1.0]
   maxvio_load_balance: [True]
 
   # LIST_ROUTER_TYPES:

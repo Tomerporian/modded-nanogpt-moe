@@ -194,6 +194,9 @@ def _totalvio_from_load(load_frac):
     return torch.abs(load_frac - expected_frac).sum() / expected_frac
 
 
+RECT_STE_THRESHOLD_MODES = ('topk', 'topk_plus_one')
+
+
 class RectIndicatorSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, margin, bandwidth):
@@ -216,13 +219,19 @@ def _hard_topk_mask(reference, topk_idx):
     return mask
 
 
-def _ste_support_mask(logits, topk_idx, bandwidth):
-    threshold = torch.gather(logits, dim=-1, index=topk_idx).min(dim=-1, keepdim=True).values
+def _rect_ste_threshold(logits, topk_idx, threshold_mode='topk'):
+    if threshold_mode == 'topk':
+        return torch.gather(logits, dim=-1, index=topk_idx).min(dim=-1, keepdim=True).values
+    if threshold_mode == 'topk_plus_one':
+        excluded_mask = _hard_topk_mask(logits, topk_idx).bool()
+        excluded_logits = logits.masked_fill(excluded_mask, float('-inf'))
+        return excluded_logits.max(dim=-1, keepdim=True).values
+    raise ValueError(f"Unsupported RectIndicatorSTE threshold mode: {threshold_mode}")
+
+
+def _ste_support_mask(logits, topk_idx, bandwidth, threshold_mode='topk'):
+    threshold = _rect_ste_threshold(logits, topk_idx, threshold_mode=threshold_mode)
     return (logits - threshold).abs() < (bandwidth * 0.5)
-
-
-def _topk_threshold(logits, topk_idx):
-    return torch.gather(logits, dim=-1, index=topk_idx).min(dim=-1, keepdim=True).values
 
 
 def _switch_topk_common(logits, topk_idx, weight_logits=None, activation='softmax', mask=None):
@@ -233,21 +242,21 @@ def _switch_topk_common(logits, topk_idx, weight_logits=None, activation='softma
     return topk_idx, routed_probs, gate
 
 
-def _soft_support_routed_probs(logits, topk_idx, weight_logits=None, activation='softmax', bandwidth=0.0):
+def _soft_support_routed_probs(logits, topk_idx, weight_logits=None, activation='softmax', bandwidth=0.0, threshold_mode='topk'):
     weight_probs = _apply_switch_activation(weight_logits, activation) if weight_logits is not None else _apply_switch_activation(logits, activation)
-    threshold = _topk_threshold(logits, topk_idx)
+    threshold = _rect_ste_threshold(logits, topk_idx, threshold_mode=threshold_mode)
     soft_mask = ((logits - threshold).abs() < (bandwidth * 0.5)).to(dtype=weight_probs.dtype)
     return _normalize_gate(weight_probs * soft_mask)
 
 
-def switch_topk(logits, k, weight_logits=None, activation='softmax', ste_width=0.0):
+def switch_topk(logits, k, weight_logits=None, activation='softmax', ste_width=0.0, ste_threshold_mode='topk'):
     """Switch/Top-k with optional rectangular STE around the top-k boundary."""
     probs_from_logits = _apply_switch_activation(logits, activation)
     topk_idx = torch.topk(probs_from_logits, k, dim=-1).indices
     hard_mask = _hard_topk_mask(logits, topk_idx)
 
     if 0.0 < ste_width:
-        threshold = _topk_threshold(logits, topk_idx)
+        threshold = _rect_ste_threshold(logits, topk_idx, threshold_mode=ste_threshold_mode)
         margin = logits - threshold
         soft_mask = RectIndicatorSTE.apply(margin, ste_width)
         mask = hard_mask + soft_mask - soft_mask.detach()
@@ -308,6 +317,7 @@ def diff_no_softmax_to_switch_transistion(
     weight_logits=None,
     topk_activation='softmax',
     ste_width=0.0,
+    ste_threshold_mode='topk',
 ):
     if diff_weight == 0:
         return switch_topk(
@@ -316,6 +326,7 @@ def diff_no_softmax_to_switch_transistion(
             weight_logits=weight_logits,
             activation=topk_activation,
             ste_width=ste_width,
+            ste_threshold_mode=ste_threshold_mode,
         )
     if diff_weight == 1:
         return diff_no_softmax(logits, k)
@@ -326,6 +337,7 @@ def diff_no_softmax_to_switch_transistion(
         weight_logits=weight_logits,
         activation=topk_activation,
         ste_width=ste_width,
+        ste_threshold_mode=ste_threshold_mode,
     )
     topk_idx, diff_routed_probs, diff_gate = diff_no_softmax(logits, k)
     routed_probs = diff_weight * diff_routed_probs + (1 - diff_weight) * switch_routed_probs
@@ -392,6 +404,7 @@ class MoE(nn.Module):
         self.router_layer_type = config.router_layer_type
         self.router_activation = config.router_activation
         self.topk_activation = config.topk_activation
+        self.rect_ste_threshold = config.rect_ste_threshold
         self.topk_ste_width = config.topk_ste_width
         self.load_balance_ste_width = config.load_balance_ste_width
         self.global_load_balance = config.global_load_balance
@@ -423,6 +436,7 @@ class MoE(nn.Module):
         assert self.router_activation in ('gelu', 'relu', 'relu_squared')
         assert self.loss_free_mode in ('none', 'deepseek', 'stopgrad')
         assert self.topk_activation  in ('softmax', 'sigmoid'), "Unsupported top-k activation: {self.topk_activation}"
+        assert self.rect_ste_threshold in RECT_STE_THRESHOLD_MODES, f"Unsupported RectIndicatorSTE threshold mode: {self.rect_ste_threshold}"
         assert self.router_logit_jitter >= 0.0, "router_logit_jitter must be non-negative"
         assert self.load_balance_ste_width >= 0.0, "load_balance_ste_width must be non-negative"
         direct_violation_losses = [
@@ -667,6 +681,7 @@ class MoE(nn.Module):
                 weight_logits=logits,
                 activation=self.topk_activation,
                 ste_width=self.topk_ste_width,
+                ste_threshold_mode=self.rect_ste_threshold,
             )
             
             unnorm_probs = _apply_switch_activation(logits_for_selection, self.topk_activation)
@@ -688,6 +703,7 @@ class MoE(nn.Module):
                 diff_weight=diff_weight,
                 topk_activation=self.topk_activation,
                 ste_width=self.topk_ste_width,
+                ste_threshold_mode=self.rect_ste_threshold,
             )
             probs = logits.softmax(dim=-1)
         elif self.router_type == 'scaled_diff_no_softmax':
@@ -715,7 +731,12 @@ class MoE(nn.Module):
         if self.topk_ste_width > 0.0 or self.load_balance_ste_width > 0.0:
             hard_mask_flat = _hard_topk_mask(logits_flat_for_stats, idx_flat).bool()
         if self.topk_ste_width > 0.0:
-            support_mask_flat = _ste_support_mask(logits_flat_for_stats, idx_flat, self.topk_ste_width)
+            support_mask_flat = _ste_support_mask(
+                logits_flat_for_stats,
+                idx_flat,
+                self.topk_ste_width,
+                threshold_mode=self.rect_ste_threshold,
+            )
             extra_support_flat = support_mask_flat & ~hard_mask_flat
             ste_soft_routed_probs_flat = _soft_support_routed_probs(
                 logits_for_selection.reshape(BT, self.num_experts),
@@ -723,9 +744,15 @@ class MoE(nn.Module):
                 weight_logits=logits.reshape(BT, self.num_experts),
                 activation=self.topk_activation,
                 bandwidth=self.topk_ste_width,
+                threshold_mode=self.rect_ste_threshold,
             )
         if self.load_balance_ste_width > 0.0:
-            lb_support_mask_flat = _ste_support_mask(logits_flat_for_stats, idx_flat, self.load_balance_ste_width)
+            lb_support_mask_flat = _ste_support_mask(
+                logits_flat_for_stats,
+                idx_flat,
+                self.load_balance_ste_width,
+                threshold_mode=self.rect_ste_threshold,
+            )
             lb_extra_support_flat = lb_support_mask_flat & ~hard_mask_flat
 
         for expert_id in range(self.num_experts):
@@ -843,7 +870,11 @@ class MoE(nn.Module):
             frac_base = global_frac_override if global_frac_override is not None else frac
             if self.load_balance_ste_width > 0.0:
                 logits_flat_for_lb = logits_for_selection.reshape(BT, self.num_experts)
-                lb_threshold = _topk_threshold(logits_flat_for_lb, idx_flat)
+                lb_threshold = _rect_ste_threshold(
+                    logits_flat_for_lb,
+                    idx_flat,
+                    threshold_mode=self.rect_ste_threshold,
+                )
                 lb_margin = logits_flat_for_lb - lb_threshold
                 lb_soft_mask = RectIndicatorSTE.apply(lb_margin, self.load_balance_ste_width)
                 lb_soft_frac = lb_soft_mask.float().mean(0) / float(self.top_k)
@@ -938,6 +969,7 @@ class GPTConfig:
     router_layer_type : str = None
     router_activation : str = 'gelu'
     topk_activation : str = 'softmax'
+    rect_ste_threshold : str = 'topk'
     global_load_balance : bool = False
     aux_use_routed_prob : bool = False
     maxvio_load_balance : bool = False

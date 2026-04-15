@@ -141,6 +141,7 @@ model = GPT(GPTConfig(
     router_layer_type=args.router_layer_type,
     router_activation=args.router_activation,
     topk_activation=args.topk_activation,
+    rect_ste_threshold=args.rect_ste_threshold,
     global_load_balance=args.global_load_balance,
     aux_use_routed_prob=args.aux_use_routed_prob,
     maxvio_load_balance=args.maxvio_load_balance,

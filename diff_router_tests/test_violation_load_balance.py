@@ -11,7 +11,25 @@ if str(REPO_ROOT) not in sys.path:
 
 from gpt_moe_model import GPTConfig, MoE
 from params import parse_args
-from wandb_logging import maxvio_per_layer, minvio_per_layer, totalvio_per_layer
+
+
+def _expected_frac(balance_tensor):
+    return balance_tensor.new_tensor(1.0 / balance_tensor.size(-1))
+
+
+def maxvio_per_layer(balance_tensor):
+    expected_frac = _expected_frac(balance_tensor)
+    return (balance_tensor.max(dim=-1).values - expected_frac) / expected_frac
+
+
+def minvio_per_layer(balance_tensor):
+    expected_frac = _expected_frac(balance_tensor)
+    return (expected_frac - balance_tensor.min(dim=-1).values) / expected_frac
+
+
+def totalvio_per_layer(balance_tensor):
+    expected_frac = _expected_frac(balance_tensor)
+    return torch.abs(balance_tensor - expected_frac).sum(dim=-1) / expected_frac
 
 
 LOSS_FLAG_FIELDS = {

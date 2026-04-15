@@ -8,6 +8,17 @@ import torch
 from megatron_indexed_dataset import MegatronDataLoader
 
 
+_SPLIT_SEED_OFFSETS = {
+    'train': 0,
+    'val': 1_000_003,
+    'test': 2_000_006,
+}
+
+
+def _loader_seed(base_seed, process_rank, split):
+    return int(base_seed) + _SPLIT_SEED_OFFSETS.get(split, 0) + int(process_rank)
+
+
 def _peek_data_shard(filename):
     """Only read the header of a .bin shard."""
     with open(filename, "rb") as f:
@@ -36,11 +47,13 @@ def _load_data_shard(filename):
 
 
 class DistributedDataLoader:
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes, seed=0, split='train'):
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.B = B
         self.T = T
+        self.seed = int(seed)
+        self.split = split
 
         self.files = sorted(glob.glob(filename_pattern))
         assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
@@ -83,12 +96,45 @@ class DistributedDataLoader:
             self.cumulative_lengths.append(cumsum)
 
         self.ntok_total = cumsum
+        self.random_high = self.ntok_total - self.T
+        assert self.random_high > 0, "dataset does not have enough tokens for the requested sequence length"
+
+        self._base_seed = _loader_seed(self.seed, self.process_rank, self.split)
+        self._generator = torch.Generator()
+        self._num_batches_drawn = 0
+        self._reset_sampler()
+
+    def _reset_sampler(self):
+        self._generator.manual_seed(self._base_seed)
+        self._num_batches_drawn = 0
+
+    def _advance_sampler(self, num_batches):
+        remaining = int(num_batches)
+        if remaining <= 0:
+            return
+
+        max_chunk_batches = max(1, 65536 // self.B)
+        while remaining > 0:
+            take = min(remaining, max_chunk_batches)
+            torch.randint(0, self.random_high, (take, self.B), generator=self._generator)
+            self._num_batches_drawn += take
+            remaining -= take
+
+    def state_dict(self):
+        return {
+            'num_batches_drawn': self._num_batches_drawn,
+        }
+
+    def load_state_dict(self, state):
+        self._reset_sampler()
+        self._advance_sampler(state.get('num_batches_drawn', 0))
 
     def next_batch(self):
         B = self.B
         T = self.T
 
-        random_positions = torch.randint(0, self.ntok_total - T, (B,))
+        random_positions = torch.randint(0, self.random_high, (B,), generator=self._generator)
+        self._num_batches_drawn += 1
 
         shard_info = []
         for pos in random_positions:
@@ -135,7 +181,7 @@ def is_megatron_dataset(path_pattern):
     return os.path.exists(idx_path)
 
 
-def create_dataloader(path_pattern, B, T, ddp_rank, ddp_world_size, split='train'):
+def create_dataloader(path_pattern, B, T, ddp_rank, ddp_world_size, split='train', seed=0):
     """
     Create appropriate dataloader based on dataset format.
     """
@@ -152,7 +198,8 @@ def create_dataloader(path_pattern, B, T, ddp_rank, ddp_world_size, split='train
             T=T,
             process_rank=ddp_rank,
             num_processes=ddp_world_size,
-            split=split
+            split=split,
+            seed=seed,
         )
 
     if ddp_rank == 0:
@@ -163,5 +210,7 @@ def create_dataloader(path_pattern, B, T, ddp_rank, ddp_world_size, split='train
         B=B,
         T=T,
         process_rank=ddp_rank,
-        num_processes=ddp_world_size
+        num_processes=ddp_world_size,
+        seed=seed,
+        split=split,
     )

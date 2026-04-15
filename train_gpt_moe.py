@@ -114,8 +114,8 @@ assert args.batch_size % (B * ddp_world_size) == 0
 train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 
 # load tokens
-train_loader = create_dataloader(args.input_bin, B, T, ddp_rank, ddp_world_size, split='train')
-val_loader = create_dataloader(args.input_val_bin, B, T, ddp_rank, ddp_world_size, split='val')
+train_loader = create_dataloader(args.input_bin, B, T, ddp_rank, ddp_world_size, split='train', seed=args.seed)
+val_loader = create_dataloader(args.input_val_bin, B, T, ddp_rank, ddp_world_size, split='val', seed=args.seed)
 if master_process:
     # Log dataset info - handle both loader types
     if hasattr(train_loader, 'ntok_total'):
@@ -126,7 +126,6 @@ if master_process:
         # MegatronDataLoader
         logging.info(f"Training DataLoader: total number of tokens: {train_loader.total_tokens}")
         logging.info(f"Validation DataLoader: total number of tokens: {val_loader.total_tokens}")
-x, y = train_loader.next_batch()
 
 # create model using parsed arguments
 model = GPT(GPTConfig(
@@ -236,6 +235,7 @@ def get_diff_topk_reg_coeff(step):
 start_step = 0
 resume_training_time_ms = 0.0
 resolved_resume_path = None
+resume_val_loader_state = None
 if args.resume:
     if args.resume == 'auto':
         resolved_resume_path = find_latest_checkpoint(args.output)
@@ -263,6 +263,14 @@ if args.resume:
         start_step = checkpoint.get('step', 0) + 1
         start_step = min(start_step, args.num_iterations)
         resume_training_time_ms = checkpoint.get('training_time_ms', 0.0)
+        train_loader_state = checkpoint.get('train_loader')
+        if train_loader_state is not None:
+            train_loader.load_state_dict(train_loader_state)
+        elif master_process:
+            logging.warning("Checkpoint is missing train loader state; resumed data order may differ from an uninterrupted run.")
+        resume_val_loader_state = checkpoint.get('val_loader')
+        if resume_val_loader_state is None and master_process:
+            logging.warning("Checkpoint is missing validation loader state; resumed validation sampling may differ from an uninterrupted run.")
         args.resume = resolved_resume_path
 
         if os.path.dirname(resolved_resume_path) != args.output:
@@ -315,9 +323,10 @@ if master_process:
 # Sample fixed sequences for expert assignment tracking
 if master_process and args.n_tracked_seq > 0:
     # Sample sequences for tracking expert assignments over time
+    tracking_loader = create_dataloader(args.input_val_bin, B, T, ddp_rank, ddp_world_size, split='val', seed=args.seed)
     tracking_sequences = []
     for _ in range(args.n_tracked_seq):
-        x_sample, _ = val_loader.next_batch()
+        x_sample, _ = tracking_loader.next_batch()
         tracking_sequences.append(x_sample[0:1])  # Take first sequence from batch
     tracking_x = torch.cat(tracking_sequences, dim=0).cuda()  # Shape: (n_tracked_seq, T)
     # Store previous expert assignments for comparison
@@ -329,18 +338,20 @@ else:
 # Sample specific tokens for matrix visualization
 if master_process and tracking_x is not None:
     # Sample 5 random token positions from the tracked sequences
-    torch.manual_seed(args.seed)  # For reproducibility
-    random.seed(args.seed)
-    
+    tracking_rng = random.Random(args.seed)
+
     tracked_token_positions = []
     for i in range(5):
-        seq_idx = random.randint(0, tracking_x.shape[0] - 1)
-        token_idx = random.randint(0, tracking_x.shape[1] - 1)
+        seq_idx = tracking_rng.randint(0, tracking_x.shape[0] - 1)
+        token_idx = tracking_rng.randint(0, tracking_x.shape[1] - 1)
         tracked_token_positions.append((seq_idx, token_idx))
         token_id = tracking_x[seq_idx, token_idx].item()
         logging.info(f"Tracking token #{i}: seq={seq_idx}, pos={token_idx}, token_id={token_id}")
 else:
     tracked_token_positions = None
+
+if resume_val_loader_state is not None:
+    val_loader.load_state_dict(resume_val_loader_state)
 
 training_time_ms = resume_training_time_ms
 # start the clock
@@ -652,6 +663,8 @@ for step in range(start_step, args.num_iterations + 1):
             model=raw_model.state_dict(),
             optimizers=[opt.state_dict() for opt in optimizers],
             schedulers=[sched.state_dict() for sched in schedulers],
+            train_loader=train_loader.state_dict(),
+            val_loader=val_loader.state_dict(),
             training_time_ms=training_time_ms,
         )
         if args.use_swa and swa_model is not None:
@@ -697,11 +710,11 @@ for step in range(start_step, args.num_iterations + 1):
             'totals_accum': totals_accum,
         }
         for _ in range(train_accumulation_steps):
-            cached_batches.append((x.clone(), y.clone()))
+            x_collect, y_collect = train_loader.next_batch()
+            cached_batches.append((x_collect, y_collect))
             with torch.no_grad():
                 with ctx:
-                    model(x, y, return_logits=False, aux_coeff=0.0, diff_topk_reg_coeff=0.0, router_context=collect_context, diff_weight=diff_weight)
-            x, y = train_loader.next_batch()
+                    model(x_collect, y_collect, return_logits=False, aux_coeff=0.0, diff_topk_reg_coeff=0.0, router_context=collect_context, diff_weight=diff_weight)
         dist.all_reduce(tokens_accum, op=dist.ReduceOp.SUM)
         dist.all_reduce(totals_accum, op=dist.ReduceOp.SUM)
         denom = torch.clamp(totals_accum.unsqueeze(1), min=1.0)
@@ -723,7 +736,7 @@ for step in range(start_step, args.num_iterations + 1):
         if use_global_lb:
             x_batch, y_batch = cached_batches[i-1]
         else:
-            x_batch, y_batch = x, y
+            x_batch, y_batch = train_loader.next_batch()
         # forward pass
         with ctx:
             (
@@ -758,9 +771,6 @@ for step in range(start_step, args.num_iterations + 1):
             for key in ROUTER_VALUE_KEYS:
                 layer_router_values_sum[key] = layer_router_values_sum[key] + layer_router_values[key].detach()
                 total_router_values_sum[key] = total_router_values_sum[key] + total_router_values[key].detach()
-        if not use_global_lb:
-            # advance the dataset for the next batch
-            x, y = train_loader.next_batch()
         # backward pass
         if i < train_accumulation_steps:
             with model.no_sync(): # there's no need to sync gradients every accumulation step

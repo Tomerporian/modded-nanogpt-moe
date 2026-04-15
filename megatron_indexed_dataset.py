@@ -13,6 +13,15 @@ import torch
 
 
 _INDEX_HEADER = b"MMIDIDX\x00\x00"
+_SPLIT_SEED_OFFSETS = {
+    'train': 0,
+    'val': 1_000_003,
+    'test': 2_000_006,
+}
+
+
+def _loader_seed(base_seed: int, process_rank: int, split: str) -> int:
+    return int(base_seed) + _SPLIT_SEED_OFFSETS.get(split, 0) + int(process_rank)
 
 
 class DType(Enum):
@@ -215,6 +224,7 @@ class MegatronDataLoader:
         process_rank: int = 0,
         num_processes: int = 1,
         split: str = 'train',
+        seed: int = 0,
         split_ratios: tuple = (98.9, 1.0, 0.1),
     ):
         self.B = B
@@ -222,6 +232,7 @@ class MegatronDataLoader:
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.split = split
+        self.seed = int(seed)
 
         # Validate split
         assert split in ['train', 'val', 'test'], f"Invalid split: {split}"
@@ -263,6 +274,37 @@ class MegatronDataLoader:
 
         # Build cumulative document offsets for efficient sampling (only for this split)
         self.doc_cumsum = numpy.concatenate([[0], numpy.cumsum(split_sizes)])
+        self.random_high = self.total_tokens - self.T
+        assert self.random_high > 0, "dataset does not have enough tokens for the requested sequence length"
+        self._base_seed = _loader_seed(self.seed, self.process_rank, self.split)
+        self._generator = torch.Generator()
+        self._num_batches_drawn = 0
+        self._reset_sampler()
+
+    def _reset_sampler(self):
+        self._generator.manual_seed(self._base_seed)
+        self._num_batches_drawn = 0
+
+    def _advance_sampler(self, num_batches: int):
+        remaining = int(num_batches)
+        if remaining <= 0:
+            return
+
+        max_chunk_batches = max(1, 65536 // self.B)
+        while remaining > 0:
+            take = min(remaining, max_chunk_batches)
+            torch.randint(0, self.random_high, (take, self.B), generator=self._generator)
+            self._num_batches_drawn += take
+            remaining -= take
+
+    def state_dict(self):
+        return {
+            'num_batches_drawn': self._num_batches_drawn,
+        }
+
+    def load_state_dict(self, state):
+        self._reset_sampler()
+        self._advance_sampler(state.get('num_batches_drawn', 0))
 
     def next_batch(self):
         """Sample a batch of random sequences"""
@@ -270,7 +312,8 @@ class MegatronDataLoader:
         T = self.T
 
         # Sample random starting positions (within this split's tokens)
-        random_positions = torch.randint(0, self.total_tokens - T, (B,))
+        random_positions = torch.randint(0, self.random_high, (B,), generator=self._generator)
+        self._num_batches_drawn += 1
 
         x_list = []
         y_list = []

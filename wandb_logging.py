@@ -4,25 +4,70 @@ import torch
 import wandb
 
 
+def _prepare_balance_tensor(balance_tensor: torch.Tensor) -> torch.Tensor:
+    if balance_tensor.ndim == 1:
+        return balance_tensor.unsqueeze(0)
+    return balance_tensor
+
+
+def _expected_frac(balance_tensor: torch.Tensor) -> torch.Tensor:
+    return balance_tensor.new_tensor(1.0 / balance_tensor.size(-1))
+
+
+def _log_per_layer_metric(per_layer_values: torch.Tensor, aggregate_key: str, per_layer_key_base: str):
+    metric_cpu = per_layer_values.detach().cpu()
+    log = {aggregate_key: float(metric_cpu.mean().item())}
+    for li in range(metric_cpu.numel()):
+        log[f'{per_layer_key_base}/Layer {li}'] = float(metric_cpu[li].item())
+    return log
+
+
 def maxvio_per_layer(balance_tensor: torch.Tensor) -> torch.Tensor:
     """
     Compute per-layer MaxVio (maximal violation) as defined in Eq. (4) of
     Wang et al. (2024), i.e., (max_i Load_i - Load_bar) / Load_bar.
     """
-    if balance_tensor.ndim == 1:
-        balance_tensor = balance_tensor.unsqueeze(0)
-    expected_frac = balance_tensor.new_tensor(1.0 / balance_tensor.size(-1))
+    balance_tensor = _prepare_balance_tensor(balance_tensor)
+    expected_frac = _expected_frac(balance_tensor)
     per_layer_max = balance_tensor.max(dim=-1).values
     return (per_layer_max - expected_frac) / expected_frac
 
 
+def minvio_per_layer(balance_tensor: torch.Tensor) -> torch.Tensor:
+    balance_tensor = _prepare_balance_tensor(balance_tensor)
+    expected_frac = _expected_frac(balance_tensor)
+    per_layer_min = balance_tensor.min(dim=-1).values
+    return (expected_frac - per_layer_min) / expected_frac
+
+
+def totalvio_per_layer(balance_tensor: torch.Tensor) -> torch.Tensor:
+    balance_tensor = _prepare_balance_tensor(balance_tensor)
+    expected_frac = _expected_frac(balance_tensor)
+    return torch.abs(balance_tensor - expected_frac).sum(dim=-1) / expected_frac
+
+
 def log_max_vio(layer_expert_balance_avg, aggregate_key, per_layer_key_base):
-    train_maxvio_layers = maxvio_per_layer(layer_expert_balance_avg.detach())
-    train_maxvio_layers_cpu = train_maxvio_layers.cpu()
-    log = {aggregate_key: float(train_maxvio_layers_cpu.mean().item())}
-    for li in range(train_maxvio_layers_cpu.numel()):
-        log[f'{per_layer_key_base}/Layer {li}'] = float(train_maxvio_layers_cpu[li].item())
-    return log
+    return _log_per_layer_metric(
+        maxvio_per_layer(layer_expert_balance_avg),
+        aggregate_key,
+        per_layer_key_base,
+    )
+
+
+def log_min_vio(layer_expert_balance_avg, aggregate_key, per_layer_key_base):
+    return _log_per_layer_metric(
+        minvio_per_layer(layer_expert_balance_avg),
+        aggregate_key,
+        per_layer_key_base,
+    )
+
+
+def log_total_vio(layer_expert_balance_avg, aggregate_key, per_layer_key_base):
+    return _log_per_layer_metric(
+        totalvio_per_layer(layer_expert_balance_avg),
+        aggregate_key,
+        per_layer_key_base,
+    )
 
 
 def log_entropy(layer_router_entropy_avg):
@@ -193,6 +238,8 @@ def wandb_train_log(
     if router_optimizer is not None:
         log['lr/router'] = float(router_optimizer.param_groups[0]['lr'])
     log.update(log_max_vio(layer_expert_balance_avg, 'train/MaxViobatch', 'train/MaxViobatch'))
+    log.update(log_min_vio(layer_expert_balance_avg, 'train/MinViobatch', 'train/MinViobatch'))
+    log.update(log_total_vio(layer_expert_balance_avg, 'train/TotalViobatch', 'train/TotalViobatch'))
     log.update(log_entropy(layer_router_entropy_avg))
     log.update(log_expert_balance(expert_balance_avg, layer_expert_balance_avg, num_experts, 'train'))
     log.update(log_router_values(layer_router_values_avg, total_router_values_avg, router_value_keys))
@@ -255,6 +302,8 @@ def wandb_val_log(
         'transition/diff_weight': diff_weight,
     })
     log.update(log_max_vio(val_layer_expert_balance, 'val/MaxVioglobal', 'val/MaxVioglobal'))
+    log.update(log_min_vio(val_layer_expert_balance, 'val/MinVioglobal', 'val/MinVioglobal'))
+    log.update(log_total_vio(val_layer_expert_balance, 'val/TotalVioglobal', 'val/TotalVioglobal'))
     log.update(log_entropy(val_layer_router_entropy))
     log.update(log_expert_balance(val_expert_balance, val_layer_expert_balance, num_experts, 'val'))
     log.update(log_router_values(val_layer_router_values, val_total_router_values, router_value_keys))

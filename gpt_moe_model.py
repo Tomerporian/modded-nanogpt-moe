@@ -170,9 +170,28 @@ def _normalize_gate(weights, eps=1e-9):
     return weights / denom
 
 
+def _expected_load_frac(load_frac):
+    return load_frac.new_tensor(1.0 / load_frac.numel())
+
+
 def _maxvio_from_load(load_frac):
-    expected_frac = load_frac.new_tensor(1.0 / load_frac.numel())
+    expected_frac = _expected_load_frac(load_frac)
     return (torch.amax(load_frac) - expected_frac) / expected_frac
+
+
+def _minvio_from_load(load_frac):
+    expected_frac = _expected_load_frac(load_frac)
+    return (expected_frac - torch.amin(load_frac)) / expected_frac
+
+
+def _minmaxvio_from_load(load_frac):
+    expected_frac = _expected_load_frac(load_frac)
+    return (torch.amax(load_frac) - torch.amin(load_frac)) / expected_frac
+
+
+def _totalvio_from_load(load_frac):
+    expected_frac = _expected_load_frac(load_frac)
+    return torch.abs(load_frac - expected_frac).sum() / expected_frac
 
 
 class RectIndicatorSTE(torch.autograd.Function):
@@ -384,6 +403,8 @@ class MoE(nn.Module):
         self.use_router_temperature = config.use_router_temperature
         self.aux_use_routed_prob = config.aux_use_routed_prob
         self.maxvio_load_balance = config.maxvio_load_balance
+        self.minmaxvio_load_balance = config.minmaxvio_load_balance
+        self.totalvio_load_balance = config.totalvio_load_balance
         self.diff_topk_reg_fp32 = config.diff_topk_reg_fp32
         self.diff_topk_reg_enabled = config.diff_topk_reg_max_coeff > 0.0
         self.theta_load_balance_coeff = config.theta_load_balance_coeff
@@ -404,8 +425,18 @@ class MoE(nn.Module):
         assert self.topk_activation  in ('softmax', 'sigmoid'), "Unsupported top-k activation: {self.topk_activation}"
         assert self.router_logit_jitter >= 0.0, "router_logit_jitter must be non-negative"
         assert self.load_balance_ste_width >= 0.0, "load_balance_ste_width must be non-negative"
-        if self.maxvio_load_balance and self.theta_load_balance_coeff > 0.0:
-            raise ValueError("Direct MaxVio load balancing cannot be combined with theta load balancing.")
+        direct_violation_losses = [
+            name for enabled, name in (
+                (self.maxvio_load_balance, 'maxvio'),
+                (self.minmaxvio_load_balance, 'minmaxvio'),
+                (self.totalvio_load_balance, 'totalvio'),
+            ) if enabled
+        ]
+        if len(direct_violation_losses) > 1:
+            raise ValueError("Only one direct violation load-balance objective can be enabled at a time.")
+        self.direct_violation_loss = direct_violation_losses[0] if direct_violation_losses else None
+        if self.direct_violation_loss is not None and self.theta_load_balance_coeff > 0.0:
+            raise ValueError("Direct violation load balancing cannot be combined with theta load balancing.")
         if self.router_type == 'hash' and self.loss_free_mode != 'none':
             raise ValueError("Loss-free load balancing requires a learned router (switch or diff).")
         if self.loss_free_mode == 'deepseek' and self.router_type != 'switch':
@@ -820,8 +851,12 @@ class MoE(nn.Module):
             else:
                 frac_for_aux = frac_base
 
-            if self.maxvio_load_balance:
+            if self.direct_violation_loss == 'maxvio':
                 aux = _maxvio_from_load(frac_for_aux)
+            elif self.direct_violation_loss == 'minmaxvio':
+                aux = _minmaxvio_from_load(frac_for_aux)
+            elif self.direct_violation_loss == 'totalvio':
+                aux = _totalvio_from_load(frac_for_aux)
             else:
                 # Switch paper:  L_aux = E * <load,prob>
                 if self.aux_use_routed_prob:
@@ -906,6 +941,8 @@ class GPTConfig:
     global_load_balance : bool = False
     aux_use_routed_prob : bool = False
     maxvio_load_balance : bool = False
+    minmaxvio_load_balance : bool = False
+    totalvio_load_balance : bool = False
     loss_free_mode : str = 'none'
     loss_free_strength : float = 1.0
     loss_free_update_rate : float = 0.001

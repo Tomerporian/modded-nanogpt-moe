@@ -1,5 +1,5 @@
 job_details:
-  name: rect_ste_aux_lb
+  name: vio_lb_exps
   output_dir: logs/seeds_and_datasets
 
 parameters:
@@ -50,17 +50,38 @@ parameters:
       aux_coeff_val: [0.01]
     - aux_coeff_train: [0.001]
       aux_coeff_val: [0.001]
-    - aux_coeff_train: [0.0001]
-      aux_coeff_val: [0.0001]
 
   router_type: ['switch']
   aux_use_routed_prob: [false]
-  load_balance_ste_width: [0.5, 1.0, 10.0]
-  global_load_balance: [true]
+  load_balance_ste_width: [1.0, 5.0, 10.0]
+  global_load_balance: [false]
 
-  # LIST_ROUTER_TYPES:
-  #   - router_type: ['diff_no_softmax']
-  #     aux_use_routed_prob: [true]
+  LIST_LB:
+    - maxvio_load_balance: [false]
+      minmaxvio_load_balance: [true]
+      totalvio_load_balance: [false]
+      rect_ste_threshold: ['topk', 'topk_plus_one']
+      top_k: [2]
+    - maxvio_load_balance: [false]
+      minmaxvio_load_balance: [false]
+      totalvio_load_balance: [true]
+      rect_ste_threshold: ['topk', 'topk_plus_one']
+      top_k: [2]
+    - maxvio_load_balance: [true]
+      minmaxvio_load_balance: [false]
+      totalvio_load_balance: [false]
+      rect_ste_threshold: ['topk_plus_one']
+      top_k: [2]
+    - maxvio_load_balance: [false]
+      minmaxvio_load_balance: [true]
+      totalvio_load_balance: [false]
+      rect_ste_threshold: ['topk']
+      top_k: [16]
+    - maxvio_load_balance: [false]
+      minmaxvio_load_balance: [false]
+      totalvio_load_balance: [true]
+      rect_ste_threshold: ['topk']
+      top_k: [16]
 
   
   # router_layer_type: ['swiglu', 'geglu', 'reglu']
@@ -69,13 +90,16 @@ parameters:
   # theta_load_balance_coeff: [0.1]
   # theta_lb_detach_theta: [false]
 
-  LIST_EXPERT_SIZES:
-    - num_experts: [64]
-      top_k: [16]
-      hidden_dim_scale_factor: [0.5]
-    # - num_experts: [64]
-    #   top_k: [2]
-    #   hidden_dim_scale_factor: [0.5]
+  num_experts: [64]
+  hidden_dim_scale_factor: [0.5]
+
+  # LIST_EXPERT_SIZES:
+  #   - num_experts: [64]
+  #     top_k: [16]
+  #     hidden_dim_scale_factor: [0.5]
+  #   - num_experts: [64]
+  #     top_k: [2]
+  #     hidden_dim_scale_factor: [0.5]
 
     # - num_experts: [128]
     #   top_k: [32]

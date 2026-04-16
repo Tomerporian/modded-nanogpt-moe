@@ -1,5 +1,5 @@
 job_details:
-  name: min-totalvio_lb_sweep
+  name: min-totalvio_lb_sweep_k16
   output_dir: logs/seeds_and_datasets
 
 parameters:

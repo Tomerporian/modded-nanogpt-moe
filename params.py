@@ -52,8 +52,8 @@ def _build_training_parser():
                        choices=['softmax', 'sigmoid'],
                        help='activation used for selecting router top-k experts')
     group.add_argument('--rect-ste-threshold', default='topk', type=str,
-                       choices=['topk', 'topk_plus_one'],
-                       help='reference value used by RectIndicatorSTE: the kth-largest selected expert (topk) or the (k+1)th-largest excluded expert (topk_plus_one)')
+                       choices=['topk', 'topk_plus_one', 'midpoint'],
+                       help='reference value used by RectIndicatorSTE: the kth-largest selected expert (topk), the (k+1)th-largest excluded expert (topk_plus_one), or the midpoint between them (midpoint)')
     group.add_argument('--topk-ste-width', default=0.0, type=float,
                        help='STE rectangle width (in logit units) used to send router gradients to near-boundary experts; 0 disables the STE correction')
     group.add_argument('--load-balance-ste-width', default=0.0, type=float,

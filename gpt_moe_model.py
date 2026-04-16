@@ -194,7 +194,7 @@ def _totalvio_from_load(load_frac):
     return torch.abs(load_frac - expected_frac).sum() / expected_frac
 
 
-RECT_STE_THRESHOLD_MODES = ('topk', 'topk_plus_one')
+RECT_STE_THRESHOLD_MODES = ('topk', 'topk_plus_one', 'midpoint')
 
 
 class RectIndicatorSTE(torch.autograd.Function):
@@ -220,12 +220,17 @@ def _hard_topk_mask(reference, topk_idx):
 
 
 def _rect_ste_threshold(logits, topk_idx, threshold_mode='topk'):
+    topk_threshold = torch.gather(logits, dim=-1, index=topk_idx).min(dim=-1, keepdim=True).values
     if threshold_mode == 'topk':
-        return torch.gather(logits, dim=-1, index=topk_idx).min(dim=-1, keepdim=True).values
+        return topk_threshold
+
+    excluded_mask = _hard_topk_mask(logits, topk_idx).bool()
+    excluded_logits = logits.masked_fill(excluded_mask, float('-inf'))
+    topk_plus_one_threshold = excluded_logits.max(dim=-1, keepdim=True).values
     if threshold_mode == 'topk_plus_one':
-        excluded_mask = _hard_topk_mask(logits, topk_idx).bool()
-        excluded_logits = logits.masked_fill(excluded_mask, float('-inf'))
-        return excluded_logits.max(dim=-1, keepdim=True).values
+        return topk_plus_one_threshold
+    if threshold_mode == 'midpoint':
+        return topk_threshold + 0.5 * (topk_plus_one_threshold - topk_threshold)
     raise ValueError(f"Unsupported RectIndicatorSTE threshold mode: {threshold_mode}")
 
 

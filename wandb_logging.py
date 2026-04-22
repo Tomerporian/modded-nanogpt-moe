@@ -14,9 +14,11 @@ def _expected_frac(balance_tensor: torch.Tensor) -> torch.Tensor:
     return balance_tensor.new_tensor(1.0 / balance_tensor.size(-1))
 
 
-def _log_per_layer_metric(per_layer_values: torch.Tensor, aggregate_key: str, per_layer_key_base: str):
+def _log_per_layer_metric(per_layer_values: torch.Tensor, aggregate_key: str, per_layer_key_base: str, worst_key=None):
     metric_cpu = per_layer_values.detach().cpu()
     log = {aggregate_key: float(metric_cpu.mean().item())}
+    if worst_key is not None:
+        log[worst_key] = float(metric_cpu.max().item())
     for li in range(metric_cpu.numel()):
         log[f'{per_layer_key_base}/Layer {li}'] = float(metric_cpu[li].item())
     return log
@@ -46,11 +48,12 @@ def totalvio_per_layer(balance_tensor: torch.Tensor) -> torch.Tensor:
     return torch.abs(balance_tensor - expected_frac).sum(dim=-1) / expected_frac
 
 
-def log_max_vio(layer_expert_balance_avg, aggregate_key, per_layer_key_base):
+def log_max_vio(layer_expert_balance_avg, aggregate_key, per_layer_key_base, worst_key=None):
     return _log_per_layer_metric(
         maxvio_per_layer(layer_expert_balance_avg),
         aggregate_key,
         per_layer_key_base,
+        worst_key=worst_key,
     )
 
 
@@ -237,7 +240,12 @@ def wandb_train_log(
     }
     if router_optimizer is not None:
         log['lr/router'] = float(router_optimizer.param_groups[0]['lr'])
-    log.update(log_max_vio(layer_expert_balance_avg, 'train/MaxViobatch', 'train/MaxViobatch'))
+    log.update(log_max_vio(
+        layer_expert_balance_avg,
+        'train/MaxViobatch',
+        'train/MaxViobatch',
+        worst_key='train/MaxViobatchWorstLayer',
+    ))
     log.update(log_min_vio(layer_expert_balance_avg, 'train/MinViobatch', 'train/MinViobatch'))
     log.update(log_total_vio(layer_expert_balance_avg, 'train/TotalViobatch', 'train/TotalViobatch'))
     log.update(log_entropy(layer_router_entropy_avg))
@@ -301,7 +309,12 @@ def wandb_val_log(
         'train/step_avg_ms': float(training_time_ms / max(timed_steps - 1, 1)),
         'transition/diff_weight': diff_weight,
     })
-    log.update(log_max_vio(val_layer_expert_balance, 'val/MaxVioglobal', 'val/MaxVioglobal'))
+    log.update(log_max_vio(
+        val_layer_expert_balance,
+        'val/MaxVioglobal',
+        'val/MaxVioglobal',
+        worst_key='val/MaxVioglobalWorstLayer',
+    ))
     log.update(log_min_vio(val_layer_expert_balance, 'val/MinVioglobal', 'val/MinVioglobal'))
     log.update(log_total_vio(val_layer_expert_balance, 'val/TotalVioglobal', 'val/TotalVioglobal'))
     log.update(log_entropy(val_layer_router_entropy))

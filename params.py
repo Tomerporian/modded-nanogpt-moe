@@ -2,6 +2,16 @@ import argparse
 import yaml
 
 
+LOAD_BALANCE_LOSS_CHOICES = ('switch', 'fsq', 'maxvio', 'maxviosq', 'minmaxvio', 'totalvio')
+LEGACY_LOAD_BALANCE_FIELDS = {
+    'fsq': 'fsq_load_balance',
+    'maxvio': 'maxvio_load_balance',
+    'maxviosq': 'maxviosq_load_balance',
+    'minmaxvio': 'minmaxvio_load_balance',
+    'totalvio': 'totalvio_load_balance',
+}
+
+
 def _str2bool(value):
     if isinstance(value, bool):
         return value
@@ -180,12 +190,21 @@ def _build_training_parser():
                        help='auxiliary loss coefficient for training')
     group.add_argument('--aux-coeff-val', default=0.0, type=float,
                        help='auxiliary loss coefficient for validation')
+    group.add_argument('--worst-layer-load-balance', action='store_true', default=False,
+                       help='apply the auxiliary load-balance loss only to the layer with the worst current auxiliary objective value')
+    group.add_argument('--load-balance-loss', default='switch', type=str,
+                       choices=LOAD_BALANCE_LOSS_CHOICES,
+                       help='auxiliary load-balance objective: standard switch aux or one of the direct violation objectives')
+    group.add_argument('--fsq-load-balance', action='store_true', default=False,
+                       help=argparse.SUPPRESS)
     group.add_argument('--maxvio-load-balance', action='store_true', default=False,
-                       help='replace the standard auxiliary load-balance loss with a direct MaxVio objective')
+                       help=argparse.SUPPRESS)
+    group.add_argument('--maxviosq-load-balance', action='store_true', default=False,
+                       help=argparse.SUPPRESS)
     group.add_argument('--minmaxvio-load-balance', action='store_true', default=False,
-                       help='replace the standard auxiliary load-balance loss with a direct MinMaxVio objective')
+                       help=argparse.SUPPRESS)
     group.add_argument('--totalvio-load-balance', action='store_true', default=False,
-                       help='replace the standard auxiliary load-balance loss with a direct TotalVio objective')
+                       help=argparse.SUPPRESS)
     group.add_argument('--diff-topk-regularizer-max-coeff', default=0.0, type=float,
                        help='maximum coefficient for the diff-topk normalization regularizer (0 disables it)')
     group.add_argument('--diff-topk-regularizer-schedule', default='constant', type=str,
@@ -234,13 +253,26 @@ def parse_args(argv=None):
         parser.error("--only-router-muon cannot be combined with --use_adamw_router")
     if args.only_router_muon and args.use_adamw_opt3:
         parser.error("--only-router-muon cannot be combined with --use_adamw_opt3")
-    direct_violation_flags = [
-        args.maxvio_load_balance,
-        args.minmaxvio_load_balance,
-        args.totalvio_load_balance,
+
+    if args.load_balance_loss not in LOAD_BALANCE_LOSS_CHOICES:
+        parser.error(f"--load-balance-loss must be one of {LOAD_BALANCE_LOSS_CHOICES}")
+
+    legacy_enabled = [
+        loss_name for loss_name, field_name in LEGACY_LOAD_BALANCE_FIELDS.items()
+        if bool(getattr(args, field_name, False))
     ]
-    if sum(bool(flag) for flag in direct_violation_flags) > 1:
-        parser.error("Only one of --maxvio-load-balance, --minmaxvio-load-balance, or --totalvio-load-balance may be enabled")
+    if len(legacy_enabled) > 1:
+        parser.error("Only one direct load-balance objective flag may be enabled at a time")
+    if legacy_enabled:
+        legacy_mode = legacy_enabled[0]
+        if args.load_balance_loss != 'switch' and args.load_balance_loss != legacy_mode:
+            parser.error("Legacy direct load-balance flags cannot disagree with --load-balance-loss")
+        args.load_balance_loss = legacy_mode
+
+    for loss_name, field_name in LEGACY_LOAD_BALANCE_FIELDS.items():
+        setattr(args, field_name, args.load_balance_loss == loss_name)
+
+    direct_violation_flags = [getattr(args, field_name) for field_name in LEGACY_LOAD_BALANCE_FIELDS.values()]
     if any(direct_violation_flags) and args.theta_load_balance_coeff > 0.0:
         parser.error("Direct violation load balancing cannot be combined with --theta-load-balance-coeff > 0")
 

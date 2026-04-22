@@ -13,11 +13,7 @@ from gpt_moe_model import GPTConfig, MoE, _rect_ste_threshold, switch_topk
 from params import parse_args
 
 
-LOSS_FLAG_FIELDS = {
-    "maxvio": "maxvio_load_balance",
-    "minmaxvio": "minmaxvio_load_balance",
-    "totalvio": "totalvio_load_balance",
-}
+LOAD_BALANCE_LOSSES = ("fsq", "maxvio", "maxviosq", "minmaxvio", "totalvio")
 
 
 def _assert_parser_rejects(argv):
@@ -46,19 +42,17 @@ def _router_grad(ste_width, threshold_mode):
 
 
 def _violation_grad(loss_name, threshold_mode):
-    loss_flags = {field: False for field in LOSS_FLAG_FIELDS.values()}
-    loss_flags[LOSS_FLAG_FIELDS[loss_name]] = True
     cfg = GPTConfig(
         n_embd=1,
         hidden_dim_scale_factor=1.0,
         num_experts=4,
         top_k=2,
         router_type="switch",
+        load_balance_loss=loss_name,
         topk_activation="softmax",
         rect_ste_threshold=threshold_mode,
         topk_ste_width=0.0,
         load_balance_ste_width=0.5,
-        **loss_flags,
     )
     moe = MoE(cfg)
     moe.router = torch.nn.Linear(1, 4, bias=False)
@@ -115,19 +109,30 @@ def main():
     assert not torch.allclose(grad_midpoint, grad_no_ste), "midpoint threshold mode should change the router gradient in this setup"
     assert not torch.allclose(grad_midpoint, grad_plus_one), "midpoint threshold mode should not collapse to the k+1-only threshold in this setup"
 
-    for loss_name in LOSS_FLAG_FIELDS:
+    for loss_name in LOAD_BALANCE_LOSSES:
         aux_topk, grad_loss_topk = _violation_grad(loss_name, "topk")
         aux_plus_one, grad_loss_plus_one = _violation_grad(loss_name, "topk_plus_one")
         aux_midpoint, grad_loss_midpoint = _violation_grad(loss_name, "midpoint")
         assert torch.allclose(aux_topk, aux_plus_one), f"{loss_name} forward value changed across RectIndicatorSTE threshold modes"
         assert torch.allclose(aux_topk, aux_midpoint), f"{loss_name} forward value changed across RectIndicatorSTE threshold modes"
-        assert grad_loss_topk[0].abs() > 1e-4, f"{loss_name} topk-threshold STE should update the top expert in this setup"
-        assert grad_loss_topk[1].abs() > 1e-4, f"{loss_name} topk-threshold STE should propagate through the selected-side boundary in this setup"
-        assert grad_loss_topk[2].abs() < 1e-7 and grad_loss_topk[3].abs() < 1e-7, f"{loss_name} topk-threshold STE should not perturb out-of-window experts"
         assert torch.allclose(grad_loss_plus_one, torch.zeros_like(grad_loss_plus_one), atol=1e-7, rtol=1e-7), f"{loss_name} k+1-threshold STE should have no auxiliary correction when only the excluded boundary expert lies in the window"
-        assert grad_loss_midpoint[1].abs() > 1e-4, f"{loss_name} midpoint-threshold STE should propagate through the selected-side boundary in this setup"
-        assert grad_loss_midpoint[2].abs() > 1e-4, f"{loss_name} midpoint-threshold STE should propagate through the excluded-side boundary in this setup"
-        assert grad_loss_midpoint[0].abs() < 1e-7 and grad_loss_midpoint[3].abs() < 1e-7, f"{loss_name} midpoint-threshold STE should stay localized to the boundary experts in this setup"
+        assert grad_loss_topk[3].abs() < 1e-7, f"{loss_name} topk-threshold STE should not perturb out-of-window experts"
+        assert grad_loss_midpoint[3].abs() < 1e-7, f"{loss_name} midpoint-threshold STE should not perturb out-of-window experts"
+
+        if loss_name in ("fsq", "maxviosq"):
+            assert grad_loss_topk[0].abs() > 1e-4, f"{loss_name} topk-threshold STE should update the top expert in this setup"
+            assert grad_loss_topk[1].abs() > 1e-4, f"{loss_name} topk-threshold STE should propagate through the selected-side boundary in this setup"
+            assert grad_loss_topk[2].abs() < 1e-7, f"{loss_name} topk-threshold STE should stay on the selected side in this setup"
+            assert grad_loss_midpoint[1].abs() > 1e-4, f"{loss_name} midpoint-threshold STE should propagate through the selected-side boundary in this setup"
+            assert grad_loss_midpoint[2].abs() > 1e-4, f"{loss_name} midpoint-threshold STE should propagate through the excluded-side boundary in this setup"
+            assert grad_loss_midpoint[0].abs() < 1e-7, f"{loss_name} midpoint-threshold STE should stay localized to the boundary experts in this setup"
+        else:
+            assert grad_loss_topk[0].abs() > 1e-4, f"{loss_name} topk-threshold STE should update the top expert in this setup"
+            assert grad_loss_topk[1].abs() > 1e-4, f"{loss_name} topk-threshold STE should propagate through the selected-side boundary in this setup"
+            assert grad_loss_topk[2].abs() < 1e-7, f"{loss_name} topk-threshold STE should not perturb out-of-window experts"
+            assert grad_loss_midpoint[1].abs() > 1e-4, f"{loss_name} midpoint-threshold STE should propagate through the selected-side boundary in this setup"
+            assert grad_loss_midpoint[2].abs() > 1e-4, f"{loss_name} midpoint-threshold STE should propagate through the excluded-side boundary in this setup"
+            assert grad_loss_midpoint[0].abs() < 1e-7, f"{loss_name} midpoint-threshold STE should stay localized to the boundary experts in this setup"
 
     routed_all_no_ste, grad_all_no_ste = _all_selected_grad(0.0, "topk")
     routed_all_plus_one, grad_all_plus_one = _all_selected_grad(0.5, "topk_plus_one")

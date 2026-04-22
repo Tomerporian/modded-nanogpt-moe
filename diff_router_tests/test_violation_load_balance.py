@@ -32,27 +32,18 @@ def totalvio_per_layer(balance_tensor):
     return torch.abs(balance_tensor - expected_frac).sum(dim=-1) / expected_frac
 
 
-LOSS_FLAG_FIELDS = {
-    "maxvio": "maxvio_load_balance",
-    "minmaxvio": "minmaxvio_load_balance",
-    "totalvio": "totalvio_load_balance",
-}
-
-
 def _build_moe(loss_name, load_balance_ste_width, global_load_balance):
-    loss_flags = {field: False for field in LOSS_FLAG_FIELDS.values()}
-    loss_flags[LOSS_FLAG_FIELDS[loss_name]] = True
     cfg = GPTConfig(
         n_embd=1,
         hidden_dim_scale_factor=1.0,
         num_experts=4,
         top_k=2,
         router_type="switch",
+        load_balance_loss=loss_name,
         topk_activation="softmax",
         global_load_balance=global_load_balance,
         topk_ste_width=0.0,
         load_balance_ste_width=load_balance_ste_width,
-        **loss_flags,
     )
     moe = MoE(cfg)
     moe.router = torch.nn.Linear(1, 4, bias=False)
@@ -93,19 +84,32 @@ def _assert_parser_rejects(argv):
 
 
 def main():
-    args, _ = parse_args(["--minmaxvio-load-balance"])
+    args, _ = parse_args(["--load-balance-loss", "minmaxvio"])
+    assert args.load_balance_loss == "minmaxvio"
     assert args.minmaxvio_load_balance
-    _assert_parser_rejects(["--maxvio-load-balance", "--totalvio-load-balance"])
-    _assert_parser_rejects(["--totalvio-load-balance", "--theta-load-balance-coeff", "0.1"])
+    args_fsq, _ = parse_args(["--load-balance-loss", "fsq"])
+    assert args_fsq.load_balance_loss == "fsq"
+    assert args_fsq.fsq_load_balance
+    args_maxviosq, _ = parse_args(["--load-balance-loss", "maxviosq"])
+    assert args_maxviosq.load_balance_loss == "maxviosq"
+    assert args_maxviosq.maxviosq_load_balance
+    _assert_parser_rejects(["--load-balance-loss", "maxvio", "--totalvio-load-balance"])
+    _assert_parser_rejects(["--load-balance-loss", "fsq", "--maxviosq-load-balance"])
+    _assert_parser_rejects(["--load-balance-loss", "totalvio", "--theta-load-balance-coeff", "0.1"])
+    _assert_parser_rejects(["--load-balance-loss", "fsq", "--theta-load-balance-coeff", "0.1"])
 
     expected_local = {
+        "fsq": torch.tensor(0.5),
         "maxvio": torch.tensor(1.0),
+        "maxviosq": torch.tensor(1.0),
         "minmaxvio": torch.tensor(2.0),
         "totalvio": torch.tensor(4.0),
     }
     global_frac = torch.tensor([0.40, 0.30, 0.10, 0.20], dtype=torch.float32)
     expected_global = {
+        "fsq": torch.tensor(0.30),
         "maxvio": torch.tensor(0.6),
+        "maxviosq": torch.tensor(0.36),
         "minmaxvio": torch.tensor(1.2),
         "totalvio": torch.tensor(1.6),
     }
@@ -116,11 +120,16 @@ def main():
         assert torch.allclose(aux_no_ste, expected_value), f"Unexpected local {loss_name} value without STE"
         assert torch.allclose(aux_ste, aux_no_ste), f"{loss_name} STE changed the local forward value"
         assert torch.allclose(grad_no_ste, torch.zeros_like(grad_no_ste)), f"{loss_name} should have zero local gradient without STE"
-        if loss_name == "maxvio":
-            assert grad_ste[0].abs() > 1e-4, "Local MaxVio STE should update the max-load expert"
-            assert grad_ste[1].abs() > 1e-4, "Local MaxVio STE should propagate through the threshold term"
-            assert grad_ste[2].abs() < 1e-7, "Local MaxVio STE should not update non-max experts directly"
-            assert grad_ste[3].abs() < 1e-7, "Local MaxVio STE should not perturb experts outside the rectangle window"
+        if loss_name in ("maxvio", "maxviosq"):
+            assert grad_ste[0].abs() > 1e-4, f"Local {loss_name} STE should update the max-load expert"
+            assert grad_ste[1].abs() > 1e-4, f"Local {loss_name} STE should propagate through the threshold term"
+            assert grad_ste[2].abs() < 1e-7, f"Local {loss_name} STE should not update non-max experts directly"
+            assert grad_ste[3].abs() < 1e-7, f"Local {loss_name} STE should not perturb experts outside the rectangle window"
+        elif loss_name == "fsq":
+            assert grad_ste[0].abs() > 1e-4, "Local fsq STE should update the overloaded expert"
+            assert grad_ste[1].abs() > 1e-4, "Local fsq STE should propagate through the threshold term"
+            assert grad_ste[2].abs() < 1e-7, "Local fsq STE should stay on the overloaded side in this setup"
+            assert grad_ste[3].abs() < 1e-7, "Local fsq STE should not perturb experts outside the rectangle window"
 
     for loss_name, expected_value in expected_global.items():
         aux_no_ste, grad_no_ste = _objective_value_and_grad(loss_name, 0.0, global_frac=global_frac)
@@ -128,11 +137,16 @@ def main():
         assert torch.allclose(aux_no_ste, expected_value), f"Unexpected global {loss_name} value without STE"
         assert torch.allclose(aux_ste, aux_no_ste), f"{loss_name} STE changed the global forward value"
         assert torch.allclose(grad_no_ste, torch.zeros_like(grad_no_ste)), f"{loss_name} should have zero global gradient without STE"
-        if loss_name == "maxvio":
-            assert grad_ste[0].abs() > 1e-4, "Global MaxVio STE should update the global max-load expert"
-            assert grad_ste[1].abs() > 1e-4, "Global MaxVio STE should propagate through the threshold term"
-            assert grad_ste[2].abs() < 1e-7, "Global MaxVio STE should not update non-max experts directly"
-            assert grad_ste[3].abs() < 1e-7, "Global MaxVio STE should not perturb experts outside the rectangle window"
+        if loss_name in ("maxvio", "maxviosq"):
+            assert grad_ste[0].abs() > 1e-4, f"Global {loss_name} STE should update the global max-load expert"
+            assert grad_ste[1].abs() > 1e-4, f"Global {loss_name} STE should propagate through the threshold term"
+            assert grad_ste[2].abs() < 1e-7, f"Global {loss_name} STE should not update non-max experts directly"
+            assert grad_ste[3].abs() < 1e-7, f"Global {loss_name} STE should not perturb experts outside the rectangle window"
+        elif loss_name == "fsq":
+            assert grad_ste[0].abs() > 1e-4, "Global fsq STE should update the overloaded expert"
+            assert grad_ste[1].abs() > 1e-4, "Global fsq STE should propagate through the threshold term"
+            assert grad_ste[2].abs() > 1e-4, "Global fsq STE should update the near-boundary underloaded expert"
+            assert grad_ste[3].abs() < 1e-7, "Global fsq STE should not perturb experts outside the rectangle window"
         else:
             assert grad_ste[0].abs() > 1e-4, f"Global {loss_name} STE should update the overloaded expert"
             assert grad_ste[2].abs() > 1e-4, f"Global {loss_name} STE should update the near-boundary underloaded expert"

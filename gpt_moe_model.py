@@ -174,9 +174,17 @@ def _expected_load_frac(load_frac):
     return load_frac.new_tensor(1.0 / load_frac.numel())
 
 
+def _fsq_from_load(load_frac):
+    return torch.square(load_frac).sum()
+
+
 def _maxvio_from_load(load_frac):
     expected_frac = _expected_load_frac(load_frac)
     return (torch.amax(load_frac) - expected_frac) / expected_frac
+
+
+def _maxviosq_from_load(load_frac):
+    return torch.square(_maxvio_from_load(load_frac))
 
 
 def _minvio_from_load(load_frac):
@@ -370,6 +378,13 @@ def init_total_router_value_tensors(device):
     return {key: torch.tensor(0.0, device=device, dtype=torch.float32) for key in ROUTER_VALUE_KEYS}
 
 
+def _aggregate_load_balance_aux(per_layer_aux, worst_layer_only):
+    if not worst_layer_only:
+        return per_layer_aux.sum()
+    worst_layer_idx = torch.argmax(per_layer_aux.detach())
+    return per_layer_aux[worst_layer_idx]
+
+
 class ReLUSquared(nn.Module):
     def forward(self, x):
         return torch.relu(x).square()
@@ -413,6 +428,7 @@ class MoE(nn.Module):
         self.topk_ste_width = config.topk_ste_width
         self.load_balance_ste_width = config.load_balance_ste_width
         self.global_load_balance = config.global_load_balance
+        self.worst_layer_load_balance = config.worst_layer_load_balance
         self.layer_idx = layer_idx
         self.loss_free_mode = config.loss_free_mode
         self.loss_free_strength = config.loss_free_strength
@@ -420,9 +436,7 @@ class MoE(nn.Module):
         self.router_logit_jitter = config.router_logit_jitter
         self.use_router_temperature = config.use_router_temperature
         self.aux_use_routed_prob = config.aux_use_routed_prob
-        self.maxvio_load_balance = config.maxvio_load_balance
-        self.minmaxvio_load_balance = config.minmaxvio_load_balance
-        self.totalvio_load_balance = config.totalvio_load_balance
+        self.load_balance_loss = getattr(config, 'load_balance_loss', 'switch')
         self.diff_topk_reg_fp32 = config.diff_topk_reg_fp32
         self.diff_topk_reg_enabled = config.diff_topk_reg_max_coeff > 0.0
         self.theta_load_balance_coeff = config.theta_load_balance_coeff
@@ -444,16 +458,30 @@ class MoE(nn.Module):
         assert self.rect_ste_threshold in RECT_STE_THRESHOLD_MODES, f"Unsupported RectIndicatorSTE threshold mode: {self.rect_ste_threshold}"
         assert self.router_logit_jitter >= 0.0, "router_logit_jitter must be non-negative"
         assert self.load_balance_ste_width >= 0.0, "load_balance_ste_width must be non-negative"
-        direct_violation_losses = [
-            name for enabled, name in (
-                (self.maxvio_load_balance, 'maxvio'),
-                (self.minmaxvio_load_balance, 'minmaxvio'),
-                (self.totalvio_load_balance, 'totalvio'),
-            ) if enabled
-        ]
-        if len(direct_violation_losses) > 1:
+        legacy_load_balance_fields = {
+            'fsq': bool(getattr(config, 'fsq_load_balance', False)),
+            'maxvio': bool(getattr(config, 'maxvio_load_balance', False)),
+            'maxviosq': bool(getattr(config, 'maxviosq_load_balance', False)),
+            'minmaxvio': bool(getattr(config, 'minmaxvio_load_balance', False)),
+            'totalvio': bool(getattr(config, 'totalvio_load_balance', False)),
+        }
+        legacy_enabled = [name for name, enabled in legacy_load_balance_fields.items() if enabled]
+        if len(legacy_enabled) > 1:
             raise ValueError("Only one direct violation load-balance objective can be enabled at a time.")
-        self.direct_violation_loss = direct_violation_losses[0] if direct_violation_losses else None
+        if legacy_enabled:
+            legacy_mode = legacy_enabled[0]
+            if self.load_balance_loss != 'switch' and self.load_balance_loss != legacy_mode:
+                raise ValueError("Legacy load-balance booleans cannot disagree with load_balance_loss.")
+            self.load_balance_loss = legacy_mode
+        valid_load_balance_losses = ('switch', 'fsq', 'maxvio', 'maxviosq', 'minmaxvio', 'totalvio')
+        if self.load_balance_loss not in valid_load_balance_losses:
+            raise ValueError(f"Unsupported load_balance_loss: {self.load_balance_loss}")
+        self.fsq_load_balance = self.load_balance_loss == 'fsq'
+        self.maxvio_load_balance = self.load_balance_loss == 'maxvio'
+        self.maxviosq_load_balance = self.load_balance_loss == 'maxviosq'
+        self.minmaxvio_load_balance = self.load_balance_loss == 'minmaxvio'
+        self.totalvio_load_balance = self.load_balance_loss == 'totalvio'
+        self.direct_violation_loss = None if self.load_balance_loss == 'switch' else self.load_balance_loss
         if self.direct_violation_loss is not None and self.theta_load_balance_coeff > 0.0:
             raise ValueError("Direct violation load balancing cannot be combined with theta load balancing.")
         if self.router_type == 'hash' and self.loss_free_mode != 'none':
@@ -887,8 +915,12 @@ class MoE(nn.Module):
             else:
                 frac_for_aux = frac_base
 
-            if self.direct_violation_loss == 'maxvio':
+            if self.direct_violation_loss == 'fsq':
+                aux = _fsq_from_load(frac_for_aux)
+            elif self.direct_violation_loss == 'maxvio':
                 aux = _maxvio_from_load(frac_for_aux)
+            elif self.direct_violation_loss == 'maxviosq':
+                aux = _maxviosq_from_load(frac_for_aux)
             elif self.direct_violation_loss == 'minmaxvio':
                 aux = _minmaxvio_from_load(frac_for_aux)
             elif self.direct_violation_loss == 'totalvio':
@@ -976,8 +1008,12 @@ class GPTConfig:
     topk_activation : str = 'softmax'
     rect_ste_threshold : str = 'topk'
     global_load_balance : bool = False
+    worst_layer_load_balance : bool = False
+    load_balance_loss : str = 'switch'
     aux_use_routed_prob : bool = False
+    fsq_load_balance : bool = False
     maxvio_load_balance : bool = False
+    maxviosq_load_balance : bool = False
     minmaxvio_load_balance : bool = False
     totalvio_load_balance : bool = False
     loss_free_mode : str = 'none'
@@ -1062,6 +1098,7 @@ class GPT(nn.Module):
         total_theta_lb = torch.tensor(0.0, device=x.device, dtype=torch.float32)
         total_router_entropy = 0
         total_expert_balance = None
+        per_layer_aux = []
         per_layer_router_entropy = []
         per_layer_expert_balance = []
         all_layer_expert_assignments = []
@@ -1093,7 +1130,7 @@ class GPT(nn.Module):
                 ) = block(
                     x, idx, router_context=router_context, diff_weight=diff_weight
                 )
-            total_aux = total_aux + aux
+            per_layer_aux.append(aux)
             total_diff_topk_reg = total_diff_topk_reg + diff_topk_reg
             total_theta_lb = total_theta_lb + theta_lb_loss
             total_router_entropy = total_router_entropy + router_entropy
@@ -1110,6 +1147,8 @@ class GPT(nn.Module):
         num_blocks = len(self.transformer.h)
         avg_router_entropy = total_router_entropy / num_blocks
         avg_expert_balance = total_expert_balance / num_blocks
+        layer_aux = torch.stack(per_layer_aux)
+        total_aux = _aggregate_load_balance_aux(layer_aux, self.config.worst_layer_load_balance)
         layer_router_entropy = torch.stack(per_layer_router_entropy)
         layer_expert_balance = torch.stack(per_layer_expert_balance, dim=0)
         layer_router_values = {

@@ -143,6 +143,7 @@ model = GPT(GPTConfig(
     topk_activation=args.topk_activation,
     rect_ste_threshold=args.rect_ste_threshold,
     global_load_balance=args.global_load_balance,
+    approx_global_load_balance=args.approx_global_load_balance,
     worst_layer_load_balance=args.worst_layer_load_balance,
     load_balance_loss=args.load_balance_loss,
     aux_use_routed_prob=args.aux_use_routed_prob,
@@ -701,11 +702,12 @@ for step in range(start_step, args.num_iterations + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     n_layers = raw_model.config.n_layer
-    use_global_lb = raw_model.config.global_load_balance
+    use_exact_global_lb = raw_model.config.global_load_balance
+    use_approx_global_lb = getattr(raw_model.config, 'approx_global_load_balance', False)
     router_context_use = None
     cached_batches = None
 
-    if use_global_lb:
+    if use_exact_global_lb:
         cached_batches = []
         tokens_accum = torch.zeros(n_layers, num_experts, device=device)
         totals_accum = torch.zeros(n_layers, device=device)
@@ -728,6 +730,12 @@ for step in range(start_step, args.num_iterations + 1):
             'mode': 'use',
             'global_frac': global_frac,
         }
+    elif use_approx_global_lb:
+        router_context_use = {
+            'mode': 'approx',
+            'tokens_accum': torch.zeros(n_layers, num_experts, device=device),
+            'totals_accum': torch.zeros(n_layers, device=device),
+        }
 
     router_entropy_sum = torch.tensor(0.0, device=device)
     expert_balance_sum = torch.zeros(num_experts, device=device)
@@ -738,7 +746,7 @@ for step in range(start_step, args.num_iterations + 1):
     diff_topk_reg_sum = torch.tensor(0.0, device=device)
     theta_lb_loss_sum = torch.tensor(0.0, device=device)
     for i in range(1, train_accumulation_steps+1):
-        if use_global_lb:
+        if use_exact_global_lb:
             x_batch, y_batch = cached_batches[i-1]
         else:
             x_batch, y_batch = train_loader.next_batch()

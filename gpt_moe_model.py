@@ -428,6 +428,7 @@ class MoE(nn.Module):
         self.topk_ste_width = config.topk_ste_width
         self.load_balance_ste_width = config.load_balance_ste_width
         self.global_load_balance = config.global_load_balance
+        self.approx_global_load_balance = getattr(config, 'approx_global_load_balance', False)
         self.worst_layer_load_balance = config.worst_layer_load_balance
         self.layer_idx = layer_idx
         self.loss_free_mode = config.loss_free_mode
@@ -458,6 +459,8 @@ class MoE(nn.Module):
         assert self.rect_ste_threshold in RECT_STE_THRESHOLD_MODES, f"Unsupported RectIndicatorSTE threshold mode: {self.rect_ste_threshold}"
         assert self.router_logit_jitter >= 0.0, "router_logit_jitter must be non-negative"
         assert self.load_balance_ste_width >= 0.0, "load_balance_ste_width must be non-negative"
+        if self.global_load_balance and self.approx_global_load_balance:
+            raise ValueError("Exact and approximate global load balancing cannot both be enabled.")
         legacy_load_balance_fields = {
             'fsq': bool(getattr(config, 'fsq_load_balance', False)),
             'maxvio': bool(getattr(config, 'maxvio_load_balance', False)),
@@ -888,6 +891,16 @@ class MoE(nn.Module):
                     global_frac_tensor = router_context.get('global_frac', None)
                     if global_frac_tensor is not None:
                         global_frac_override = global_frac_tensor[self.layer_idx]
+            elif self.approx_global_load_balance and router_context is not None and ctx_mode == 'approx':
+                synced_tokens_per_expert = tokens_per_expert.detach().clone()
+                synced_total_tokens = local_total_tokens.detach().clone()
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(synced_tokens_per_expert, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(synced_total_tokens, op=dist.ReduceOp.SUM)
+                router_context['tokens_accum'][self.layer_idx] += synced_tokens_per_expert
+                router_context['totals_accum'][self.layer_idx] += synced_total_tokens
+                denom_global = torch.clamp(router_context['totals_accum'][self.layer_idx], min=1.0)
+                global_frac_override = router_context['tokens_accum'][self.layer_idx] / denom_global
 
             if self.loss_free_enabled and self.training and ctx_mode != 'collect':
                 if global_frac_override is not None:
@@ -1008,6 +1021,7 @@ class GPTConfig:
     topk_activation : str = 'softmax'
     rect_ste_threshold : str = 'topk'
     global_load_balance : bool = False
+    approx_global_load_balance : bool = False
     worst_layer_load_balance : bool = False
     load_balance_loss : str = 'switch'
     aux_use_routed_prob : bool = False

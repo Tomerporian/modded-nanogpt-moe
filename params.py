@@ -70,6 +70,8 @@ def _build_training_parser():
                        help='STE rectangle width (in logit units) used to send auxiliary load-balance gradients to near-boundary experts; 0 disables the correction')
     group.add_argument('--global-load-balance', action='store_true', default=False,
                        help='enable global batch load balancing for auxiliary router loss')
+    group.add_argument('--approx-global-load-balance', action='store_true', default=False,
+                       help='enable approximate global batch load balancing via a running gradient-accumulation buffer; avoids the extra exact-global prepass')
     group.add_argument('--aux-use-routed-prob', action='store_true', default=False,
                        help='compute aux load balancing loss with the probabilities actually used to route tokens')
     group.add_argument('--loss-free-mode', default='none', type=str, choices=['none', 'deepseek', 'stopgrad'],
@@ -253,6 +255,8 @@ def parse_args(argv=None):
         parser.error("--only-router-muon cannot be combined with --use_adamw_router")
     if args.only_router_muon and args.use_adamw_opt3:
         parser.error("--only-router-muon cannot be combined with --use_adamw_opt3")
+    if args.global_load_balance and args.approx_global_load_balance:
+        parser.error("--global-load-balance cannot be combined with --approx-global-load-balance")
 
     if args.load_balance_loss not in LOAD_BALANCE_LOSS_CHOICES:
         parser.error(f"--load-balance-loss must be one of {LOAD_BALANCE_LOSS_CHOICES}")

@@ -22,6 +22,15 @@ ROUTER_VALUE_KEYS = (
     'ste_lb_active_token_frac',
     'ste_lb_extra_experts_per_token',
     'ste_lb_boundary_gap',
+    'ste_lb_excess_frac',
+    'ste_lb_dead_excess_frac',
+    'ste_lb_dead_excess_max_frac',
+    'ste_lb_deficit_frac',
+    'ste_lb_dead_deficit_frac',
+    'ste_lb_dead_deficit_max_frac',
+    'ste_lb_selected_support_frac',
+    'ste_lb_anchored_selected_frac',
+    'ste_lb_anchored_balanced_frac',
     'max_scaler',
     'min_scaler'
 )
@@ -927,6 +936,57 @@ class MoE(nn.Module):
                 frac_for_aux = frac_base + lb_soft_frac - lb_soft_frac.detach()
             else:
                 frac_for_aux = frac_base
+
+            if self.load_balance_ste_width > 0.0 and lb_support_mask_flat is not None and hard_mask_flat is not None:
+                lb_selected_support_flat = lb_support_mask_flat & hard_mask_flat
+                lb_unselected_support_flat = lb_support_mask_flat & ~hard_mask_flat
+                active_selected_frac = lb_selected_support_flat.float().mean(0) / float(self.top_k)
+                active_unselected_frac = lb_unselected_support_flat.float().mean(0) / float(self.top_k)
+                target_frac = frac_base.new_full((self.num_experts,), 1.0 / self.num_experts)
+                excess_frac = torch.relu(frac_base - target_frac)
+                deficit_frac = torch.relu(target_frac - frac_base)
+                dead_excess = torch.relu(excess_frac - active_selected_frac)
+                dead_deficit = torch.relu(deficit_frac - active_unselected_frac)
+                selected_dead_frac = torch.relu(frac_base - active_selected_frac)
+                anchored_selected_frac = torch.relu(selected_dead_frac - dead_excess)
+                excess_total = excess_frac.sum()
+                deficit_total = deficit_frac.sum()
+                balanced_load_total = torch.minimum(frac_base, target_frac).sum()
+                zero_mask = torch.zeros_like(excess_frac)
+                dead_excess_per_expert_frac = torch.where(
+                    excess_frac > 0,
+                    dead_excess / torch.clamp(excess_frac, min=1e-9),
+                    zero_mask,
+                )
+                dead_deficit_per_expert_frac = torch.where(
+                    deficit_frac > 0,
+                    dead_deficit / torch.clamp(deficit_frac, min=1e-9),
+                    torch.zeros_like(deficit_frac),
+                )
+                router_value_stats.update({
+                    'ste_lb_excess_frac': excess_total,
+                    'ste_lb_dead_excess_frac': dead_excess.sum() / torch.clamp(excess_total, min=1e-9),
+                    'ste_lb_dead_excess_max_frac': dead_excess_per_expert_frac.max(),
+                    'ste_lb_deficit_frac': deficit_total,
+                    'ste_lb_dead_deficit_frac': dead_deficit.sum() / torch.clamp(deficit_total, min=1e-9),
+                    'ste_lb_dead_deficit_max_frac': dead_deficit_per_expert_frac.max(),
+                    'ste_lb_selected_support_frac': active_selected_frac.sum(),
+                    'ste_lb_anchored_selected_frac': anchored_selected_frac.sum(),
+                    'ste_lb_anchored_balanced_frac': anchored_selected_frac.sum() / torch.clamp(balanced_load_total, min=1e-9),
+                })
+            else:
+                zero = torch.tensor(0.0, device=x.device)
+                router_value_stats.update({
+                    'ste_lb_excess_frac': zero,
+                    'ste_lb_dead_excess_frac': zero,
+                    'ste_lb_dead_excess_max_frac': zero,
+                    'ste_lb_deficit_frac': zero,
+                    'ste_lb_dead_deficit_frac': zero,
+                    'ste_lb_dead_deficit_max_frac': zero,
+                    'ste_lb_selected_support_frac': zero,
+                    'ste_lb_anchored_selected_frac': zero,
+                    'ste_lb_anchored_balanced_frac': zero,
+                })
 
             if self.direct_violation_loss == 'fsq':
                 aux = _fsq_from_load(frac_for_aux)

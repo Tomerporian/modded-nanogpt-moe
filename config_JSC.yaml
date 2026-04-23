@@ -1,5 +1,5 @@
 job_details:
-  name: vio_lb_n256_k16
+  name: sq_metrics_lb
   output_dir: logs/seeds_and_datasets
 
 parameters:
@@ -49,48 +49,21 @@ parameters:
   aux_use_routed_prob: [false]
   load_balance_ste_width: [1.0]
   global_load_balance: [false]
+  load_balance_loss: ['fsq', 'maxviosq']
 
-  LIST_EXPS:
-    - maxvio_load_balance: [true]
-      minmaxvio_load_balance: [false]
-      totalvio_load_balance: [false]
-      aux_coeff_train: [0.0002]
-      aux_coeff_val: [0.0002]
-      rect_ste_threshold: ['topk']
-    - maxvio_load_balance: [true]
-      minmaxvio_load_balance: [false]
-      totalvio_load_balance: [false]
-      aux_coeff_train: [0.002]
-      aux_coeff_val: [0.002]
-      rect_ste_threshold: ['topk']
-    - maxvio_load_balance: [false]
-      minmaxvio_load_balance: [true]
-      totalvio_load_balance: [false]
-      aux_coeff_train: [0.00025]
-      aux_coeff_val: [0.00025]
-      rect_ste_threshold: ['topk']
-    - maxvio_load_balance: [false]
-      minmaxvio_load_balance: [true]
-      totalvio_load_balance: [false]
-      aux_coeff_train: [0.0025]
-      aux_coeff_val: [0.0025]
-      rect_ste_threshold: ['topk']
-    - maxvio_load_balance: [false]
-      minmaxvio_load_balance: [false]
-      totalvio_load_balance: [true]
-      aux_coeff_train: [0.0002]
-      aux_coeff_val: [0.0002]
-      rect_ste_threshold: ['topk']
-    - maxvio_load_balance: [false]
-      minmaxvio_load_balance: [false]
-      totalvio_load_balance: [true]
-      aux_coeff_train: [0.002]
-      aux_coeff_val: [0.002]
-      rect_ste_threshold: ['topk']
+  LIST_COEFS:
+    - aux_coeff_train: [0.1]
+      aux_coeff_val: [0.1]
+    - aux_coeff_train: [0.01]
+      aux_coeff_val: [0.01]
+    - aux_coeff_train: [0.001]
+      aux_coeff_val: [0.001]
+    - aux_coeff_train: [0.0001]
+      aux_coeff_val: [0.0001]
   
-  top_k: [16]
-  num_experts: [256]
-  hidden_dim_scale_factor: [0.125]
+  top_k: [16,2]
+  num_experts: [64]
+  hidden_dim_scale_factor: [0.5]
 
   # LIST_EXPERT_SIZES:
   #   - num_experts: [64]

@@ -90,6 +90,9 @@ def main():
     args_fsq, _ = parse_args(["--load-balance-loss", "fsq"])
     assert args_fsq.load_balance_loss == "fsq"
     assert args_fsq.fsq_load_balance
+    args_centered_fsq, _ = parse_args(["--load-balance-loss", "centered_fsq"])
+    assert args_centered_fsq.load_balance_loss == "centered_fsq"
+    assert not args_centered_fsq.fsq_load_balance
     args_maxviosq, _ = parse_args(["--load-balance-loss", "maxviosq"])
     assert args_maxviosq.load_balance_loss == "maxviosq"
     assert args_maxviosq.maxviosq_load_balance
@@ -97,21 +100,24 @@ def main():
     _assert_parser_rejects(["--load-balance-loss", "fsq", "--maxviosq-load-balance"])
     _assert_parser_rejects(["--load-balance-loss", "totalvio", "--theta-load-balance-coeff", "0.1"])
     _assert_parser_rejects(["--load-balance-loss", "fsq", "--theta-load-balance-coeff", "0.1"])
+    _assert_parser_rejects(["--load-balance-loss", "centered_fsq", "--theta-load-balance-coeff", "0.1"])
 
     expected_local = {
-        "fsq": torch.tensor(0.5),
-        "maxvio": torch.tensor(1.0),
-        "maxviosq": torch.tensor(1.0),
-        "minmaxvio": torch.tensor(2.0),
-        "totalvio": torch.tensor(4.0),
+        "fsq": torch.tensor(2.0),
+        "centered_fsq": torch.tensor(2.0),
+        "maxvio": torch.tensor(2.0),
+        "maxviosq": torch.tensor(4.0 / 3.0),
+        "minmaxvio": torch.tensor(2.5),
+        "totalvio": torch.tensor(3.0),
     }
     global_frac = torch.tensor([0.40, 0.30, 0.10, 0.20], dtype=torch.float32)
     expected_global = {
-        "fsq": torch.tensor(0.30),
-        "maxvio": torch.tensor(0.6),
-        "maxviosq": torch.tensor(0.36),
-        "minmaxvio": torch.tensor(1.2),
-        "totalvio": torch.tensor(1.6),
+        "fsq": torch.tensor(1.2),
+        "centered_fsq": torch.tensor(1.2),
+        "maxvio": torch.tensor(1.6),
+        "maxviosq": torch.tensor(1.12),
+        "minmaxvio": torch.tensor(1.9),
+        "totalvio": torch.tensor(1.8),
     }
 
     for loss_name, expected_value in expected_local.items():
@@ -130,6 +136,11 @@ def main():
             assert grad_ste[1].abs() > 1e-4, "Local fsq STE should propagate through the threshold term"
             assert grad_ste[2].abs() < 1e-7, "Local fsq STE should stay on the overloaded side in this setup"
             assert grad_ste[3].abs() < 1e-7, "Local fsq STE should not perturb experts outside the rectangle window"
+        elif loss_name == "centered_fsq":
+            assert grad_ste[0].abs() > 1e-4, "Local centered_fsq STE should update the overloaded expert"
+            assert grad_ste[1].abs() < 1e-6, "Local centered_fsq STE should cancel the boundary threshold term in this setup"
+            assert grad_ste[2].abs() > 1e-4, "Local centered_fsq STE should update the near-boundary underloaded expert"
+            assert grad_ste[3].abs() < 1e-7, "Local centered_fsq STE should not perturb experts outside the rectangle window"
 
     for loss_name, expected_value in expected_global.items():
         aux_no_ste, grad_no_ste = _objective_value_and_grad(loss_name, 0.0, global_frac=global_frac)
@@ -147,6 +158,11 @@ def main():
             assert grad_ste[1].abs() > 1e-4, "Global fsq STE should propagate through the threshold term"
             assert grad_ste[2].abs() > 1e-4, "Global fsq STE should update the near-boundary underloaded expert"
             assert grad_ste[3].abs() < 1e-7, "Global fsq STE should not perturb experts outside the rectangle window"
+        elif loss_name == "centered_fsq":
+            assert grad_ste[0].abs() > 1e-4, "Global centered_fsq STE should update the overloaded expert"
+            assert grad_ste[2].abs() > 1e-4, "Global centered_fsq STE should update the near-boundary underloaded expert"
+            assert grad_ste[1].abs() < 1e-6, "Global centered_fsq STE should cancel the boundary threshold term in this setup"
+            assert grad_ste[3].abs() < 1e-7, "Global centered_fsq STE should not perturb experts outside the rectangle window"
         else:
             assert grad_ste[0].abs() > 1e-4, f"Global {loss_name} STE should update the overloaded expert"
             assert grad_ste[2].abs() > 1e-4, f"Global {loss_name} STE should update the near-boundary underloaded expert"

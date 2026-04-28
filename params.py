@@ -2,7 +2,7 @@ import argparse
 import yaml
 
 
-LOAD_BALANCE_LOSS_CHOICES = ('switch', 'fsq', 'maxvio', 'maxviosq', 'minmaxvio', 'totalvio')
+LOAD_BALANCE_LOSS_CHOICES = ('switch', 'fsq', 'centered_fsq', 'maxvio', 'maxviosq', 'minmaxvio', 'totalvio')
 LEGACY_LOAD_BALANCE_FIELDS = {
     'fsq': 'fsq_load_balance',
     'maxvio': 'maxvio_load_balance',
@@ -276,8 +276,7 @@ def parse_args(argv=None):
     for loss_name, field_name in LEGACY_LOAD_BALANCE_FIELDS.items():
         setattr(args, field_name, args.load_balance_loss == loss_name)
 
-    direct_violation_flags = [getattr(args, field_name) for field_name in LEGACY_LOAD_BALANCE_FIELDS.values()]
-    if any(direct_violation_flags) and args.theta_load_balance_coeff > 0.0:
+    if args.load_balance_loss != 'switch' and args.theta_load_balance_coeff > 0.0:
         parser.error("Direct violation load balancing cannot be combined with --theta-load-balance-coeff > 0")
 
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)

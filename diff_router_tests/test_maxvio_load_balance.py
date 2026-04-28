@@ -71,7 +71,7 @@ def main():
     local_no_ste, grad_local_no_ste = _maxvio_value_and_grad(0.0)
     local_ste, grad_local_ste = _maxvio_value_and_grad(0.5)
 
-    assert torch.allclose(local_no_ste, torch.tensor(1.0)), "Unexpected local MaxVio value without STE"
+    assert torch.allclose(local_no_ste, torch.tensor(2.0)), "Unexpected local MaxVio value without STE"
     assert torch.allclose(local_ste, local_no_ste), "MaxVio STE changed the local forward value"
     assert torch.allclose(grad_local_no_ste, torch.zeros_like(grad_local_no_ste)), "Direct MaxVio should have zero local gradient without STE"
     assert grad_local_ste[0].abs() > 1e-4, "Local MaxVio STE should update the max-load expert"
@@ -83,7 +83,7 @@ def main():
     global_no_ste, grad_global_no_ste = _maxvio_value_and_grad(0.0, global_frac=global_frac)
     global_ste, grad_global_ste = _maxvio_value_and_grad(0.5, global_frac=global_frac)
 
-    assert torch.allclose(global_no_ste, torch.tensor(0.6)), "Unexpected global MaxVio value without STE"
+    assert torch.allclose(global_no_ste, torch.tensor(1.6)), "Unexpected global MaxVio value without STE"
     assert torch.allclose(global_ste, global_no_ste), "MaxVio STE changed the global forward value"
     assert torch.allclose(grad_global_no_ste, torch.zeros_like(grad_global_no_ste)), "Direct MaxVio should have zero global gradient without STE"
     assert grad_global_ste[0].abs() > 1e-4, "Global MaxVio STE should update the global max-load expert"
@@ -92,7 +92,7 @@ def main():
     assert grad_global_ste[2].abs() < 1e-7, "Global MaxVio STE should not update non-max experts directly"
 
     mismatch_aux, mismatch_grad = _global_mismatch_value_and_grad(0.5)
-    assert torch.allclose(mismatch_aux, torch.tensor(0.6)), "Unexpected global MaxVio value in mismatch case"
+    assert torch.allclose(mismatch_aux, torch.tensor(1.6)), "Unexpected global MaxVio value in mismatch case"
     assert mismatch_grad[0].abs() < 1e-7, "Global MaxVio should not give gradient to a local-only max expert"
     assert mismatch_grad[1].abs() > 1e-4, "Global MaxVio mismatch case should still propagate through the local threshold term"
     assert mismatch_grad[2].abs() > 1e-4, "Global MaxVio mismatch case should update the true global max expert"

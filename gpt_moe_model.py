@@ -183,32 +183,54 @@ def _expected_load_frac(load_frac):
     return load_frac.new_tensor(1.0 / load_frac.numel())
 
 
-def _fsq_from_load(load_frac):
-    return torch.square(load_frac).sum()
+def _num_experts_from_load(load_frac):
+    return load_frac.new_tensor(float(load_frac.numel()))
 
 
-def _maxvio_from_load(load_frac):
+def _maxvio_penalty_from_load(load_frac):
     expected_frac = _expected_load_frac(load_frac)
     return (torch.amax(load_frac) - expected_frac) / expected_frac
 
 
+# Match Switch aux scale: balanced load -> 1, collapsed load -> num_experts.
+def _fsq_from_load(load_frac):
+    num_experts = _num_experts_from_load(load_frac)
+    return num_experts * torch.square(load_frac).sum()
+
+
+def _centered_fsq_from_load(load_frac):
+    expected_frac = _expected_load_frac(load_frac)
+    num_experts = _num_experts_from_load(load_frac)
+    return 1.0 + num_experts * torch.square(load_frac - expected_frac).sum()
+
+
+def _maxvio_from_load(load_frac):
+    return 1.0 + _maxvio_penalty_from_load(load_frac)
+
+
 def _maxviosq_from_load(load_frac):
-    return torch.square(_maxvio_from_load(load_frac))
+    max_penalty = torch.clamp(_num_experts_from_load(load_frac) - 1.0, min=1.0)
+    return 1.0 + torch.square(_maxvio_penalty_from_load(load_frac)) / max_penalty
 
 
 def _minvio_from_load(load_frac):
+    num_experts = _num_experts_from_load(load_frac)
     expected_frac = _expected_load_frac(load_frac)
-    return (expected_frac - torch.amin(load_frac)) / expected_frac
+    raw_penalty = (expected_frac - torch.amin(load_frac)) / expected_frac
+    return 1.0 + raw_penalty * (num_experts - 1.0)
 
 
 def _minmaxvio_from_load(load_frac):
+    num_experts = _num_experts_from_load(load_frac)
     expected_frac = _expected_load_frac(load_frac)
-    return (torch.amax(load_frac) - torch.amin(load_frac)) / expected_frac
+    raw_penalty = (torch.amax(load_frac) - torch.amin(load_frac)) / expected_frac
+    return 1.0 + raw_penalty * (num_experts - 1.0) / torch.clamp(num_experts, min=1.0)
 
 
 def _totalvio_from_load(load_frac):
     expected_frac = _expected_load_frac(load_frac)
-    return torch.abs(load_frac - expected_frac).sum() / expected_frac
+    raw_penalty = torch.abs(load_frac - expected_frac).sum() / expected_frac
+    return 1.0 + 0.5 * raw_penalty
 
 
 RECT_STE_THRESHOLD_MODES = ('topk', 'topk_plus_one', 'midpoint')
@@ -485,10 +507,11 @@ class MoE(nn.Module):
             if self.load_balance_loss != 'switch' and self.load_balance_loss != legacy_mode:
                 raise ValueError("Legacy load-balance booleans cannot disagree with load_balance_loss.")
             self.load_balance_loss = legacy_mode
-        valid_load_balance_losses = ('switch', 'fsq', 'maxvio', 'maxviosq', 'minmaxvio', 'totalvio')
+        valid_load_balance_losses = ('switch', 'fsq', 'centered_fsq', 'maxvio', 'maxviosq', 'minmaxvio', 'totalvio')
         if self.load_balance_loss not in valid_load_balance_losses:
             raise ValueError(f"Unsupported load_balance_loss: {self.load_balance_loss}")
         self.fsq_load_balance = self.load_balance_loss == 'fsq'
+        self.centered_fsq_load_balance = self.load_balance_loss == 'centered_fsq'
         self.maxvio_load_balance = self.load_balance_loss == 'maxvio'
         self.maxviosq_load_balance = self.load_balance_loss == 'maxviosq'
         self.minmaxvio_load_balance = self.load_balance_loss == 'minmaxvio'
@@ -990,6 +1013,8 @@ class MoE(nn.Module):
 
             if self.direct_violation_loss == 'fsq':
                 aux = _fsq_from_load(frac_for_aux)
+            elif self.direct_violation_loss == 'centered_fsq':
+                aux = _centered_fsq_from_load(frac_for_aux)
             elif self.direct_violation_loss == 'maxvio':
                 aux = _maxvio_from_load(frac_for_aux)
             elif self.direct_violation_loss == 'maxviosq':

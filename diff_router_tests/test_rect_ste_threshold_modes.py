@@ -13,7 +13,7 @@ from gpt_moe_model import GPTConfig, MoE, _rect_ste_threshold, switch_topk
 from params import parse_args
 
 
-LOAD_BALANCE_LOSSES = ("fsq", "maxvio", "maxviosq", "minmaxvio", "totalvio")
+LOAD_BALANCE_LOSSES = ("fsq", "centered_fsq", "maxvio", "maxviosq", "minmaxvio", "totalvio")
 
 
 def _assert_parser_rejects(argv):
@@ -119,7 +119,7 @@ def main():
         assert grad_loss_topk[3].abs() < 1e-7, f"{loss_name} topk-threshold STE should not perturb out-of-window experts"
         assert grad_loss_midpoint[3].abs() < 1e-7, f"{loss_name} midpoint-threshold STE should not perturb out-of-window experts"
 
-        if loss_name in ("fsq", "maxviosq"):
+        if loss_name in ("fsq", "centered_fsq", "maxviosq"):
             assert grad_loss_topk[0].abs() > 1e-4, f"{loss_name} topk-threshold STE should update the top expert in this setup"
             assert grad_loss_topk[1].abs() > 1e-4, f"{loss_name} topk-threshold STE should propagate through the selected-side boundary in this setup"
             assert grad_loss_topk[2].abs() < 1e-7, f"{loss_name} topk-threshold STE should stay on the selected side in this setup"

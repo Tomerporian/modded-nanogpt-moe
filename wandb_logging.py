@@ -346,9 +346,16 @@ def init_wandb(args,
     })
 
     run_name = os.path.basename(args.output)
-    wandb.init(project=args.wandb_project,
-               name=run_name,
-               config=config)
+    init_kwargs = {
+        'project': args.wandb_project,
+        'name': run_name,
+        'config': config,
+    }
+    wandb_dir = os.environ.get('WANDB_DIR')
+    if wandb_dir:
+        os.makedirs(wandb_dir, exist_ok=True)
+        init_kwargs['dir'] = wandb_dir
+    wandb.init(**init_kwargs)
 
 
 def _collect_router_temperatures(raw_model):

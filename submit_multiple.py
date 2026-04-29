@@ -56,6 +56,18 @@ def expand_tuple_keys(dict_with_tuples):
         return expand_tuple_keys(dict_with_tuples)
 
 
+def make_config_label(kvs, varying_keys):
+    return '+'.join([f'{format_key(k)}={format_value(kvs[k])}'
+                     for k in varying_keys])
+
+
+def make_job_name(batch_name, spec_name):
+    short_name = spec_name.split('_', 1)[0]
+    if not short_name.isdigit():
+        short_name = spec_name[:24]
+    return f'{batch_name}_{short_name}'
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('jobfile', type=str,
@@ -122,13 +134,13 @@ if __name__ == '__main__':
     def grid_generator():
         chunk_spec_filename = []
         for i, kvs in enumerate(configs):
-            spec_name = '+'.join([f'{format_key(k)}={format_value(kvs[k])}'
-                                 for k in varying_keys])
-            spec_name = f'{i:03d}_{batch_name}+{spec_name}'
+            spec_name = f'{i:03d}'
+            config_label = make_config_label(kvs, varying_keys)
+            run_name = f'{spec_name}_{batch_name}+{config_label}' if config_label else f'{spec_name}_{batch_name}'
             out_dir = os.path.join(batch_dir, spec_name)
             if os.path.exists(os.path.join(out_dir, 'done')):
                 continue
-            spec = dict(output_dir=out_dir, **kvs)
+            spec = dict(output_dir=out_dir, run_name=run_name, config_label=config_label, **kvs)
             spec_filename = os.path.join(out_dir, 'spec.yaml')
             spec['output'] = out_dir
             # spec['experiment'] = out_dir
@@ -138,26 +150,28 @@ if __name__ == '__main__':
                 yaml.dump(spec, f, sort_keys=True)
             chunk_spec_filename.append(spec_filename)
             if len(chunk_spec_filename) == args.chunk_size:
-                yield spec_name, chunk_spec_filename, out_dir
+                yield make_job_name(batch_name, spec_name), chunk_spec_filename, out_dir
                 chunk_spec_filename = []
         if chunk_spec_filename:
-            yield spec_name, chunk_spec_filename, out_dir
+            yield make_job_name(batch_name, spec_name), chunk_spec_filename, out_dir
     
     def grid_generator_rerun():
         chunk_spec_filename = []
-        for spec_name in os.listdir(batch_dir):
+        for spec_name in sorted(os.listdir(batch_dir)):
             out_dir = os.path.join(batch_dir, spec_name)
             if not os.path.isdir(out_dir) or spec_name.startswith('.'):
+                continue
+            if spec_name == 'slurm_logs':
                 continue
             if os.path.exists(os.path.join(out_dir, 'done')):
                 continue
             spec_filename = os.path.join(out_dir, 'spec.yaml')
             chunk_spec_filename.append(spec_filename)
             if len(chunk_spec_filename) == args.chunk_size:
-                yield spec_name, chunk_spec_filename, out_dir
+                yield make_job_name(batch_name, spec_name), chunk_spec_filename, out_dir
                 chunk_spec_filename = []
         if chunk_spec_filename:
-            yield spec_name, chunk_spec_filename, out_dir
+            yield make_job_name(batch_name, spec_name), chunk_spec_filename, out_dir
 
     # --------------------- HANDLE OUTPUT FOLDER -------------------------------
     if not (args.dry_run or args.rerun):
@@ -205,7 +219,3 @@ if __name__ == '__main__':
         # if count==7500:
         #     break
     print(f'\nStarted {count} jobs in total')
-
-
-
-

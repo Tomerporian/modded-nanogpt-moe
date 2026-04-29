@@ -345,7 +345,7 @@ def init_wandb(args,
         'attention_backend': 'cudnn_sdp',
     })
 
-    run_name = os.path.basename(args.output)
+    run_name = getattr(args, 'run_name', None) or os.path.basename(args.output)
     init_kwargs = {
         'project': args.wandb_project,
         'name': run_name,

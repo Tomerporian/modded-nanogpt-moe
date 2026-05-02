@@ -1,5 +1,5 @@
 job_details:
-  name: large_scale_baseline
+  name: large_scale_centered_fsq05
   output_dir: /e/scratch/reformo/shechter1/checkpoints/modded-nanogpt-moe/
 
 parameters:
@@ -49,7 +49,7 @@ parameters:
   aux_use_routed_prob: [false]
   global_load_balance: [false]
   load_balance_loss: ['centered_fsq']
-  load_balance_ste_width: [1.0]
+  load_balance_ste_width: [0.5]
   aux_coeff_train: [0.01]
   aux_coeff_val: [0.01]
 

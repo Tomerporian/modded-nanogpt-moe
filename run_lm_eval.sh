@@ -1,8 +1,8 @@
 #!/bin/bash
 
-DIR_PATH="/data/mikey/exps/test/26-01-31-diff_no_softmax/000_26-01-31-diff_no_softmax+"
+DIR_PATH="/e/scratch/reformo/porian1/checkpoints/modded-nanogpt-moe/26-04-29-large_scale_baseline/000_26-04-29-large_scale_baseline+/"
 
 python hellaswag.py \
     --run_dir ${DIR_PATH} \
-    --tasks wikitext,blimp,lambada_openai,arc_easy,piqa,hellaswag \
+    --tasks blimp,lambada_openai,arc_easy,arc_challenge,piqa,hellaswag,winogrande,glue \
     --limit 10 > ${DIR_PATH}/logfile_eval.log 2>&1

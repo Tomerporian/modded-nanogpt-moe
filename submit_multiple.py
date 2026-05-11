@@ -100,6 +100,7 @@ if __name__ == '__main__':
         batch_name = datetime.datetime.now().strftime('%y-%m-%d') + '-' + job_details['name']
         batch_dir = os.path.join(output_dir, batch_name)
     else:
+        args.jobfile = os.path.normpath(args.jobfile)
         jobfile = os.path.join(args.jobfile, 'job.yaml')
         with open(jobfile, 'r') as f:
             job_description = yaml.safe_load(f)

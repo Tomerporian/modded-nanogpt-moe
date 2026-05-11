@@ -1,6 +1,6 @@
 job_details:
-  name: baseline_lb_n256_k16
-  output_dir: logs/seeds_and_datasets
+  name: test_small
+  output_dir: /e/scratch/reformo/shechter1/checkpoints/test/
 
 parameters:
   LIST_DATASETS:
@@ -8,8 +8,10 @@ parameters:
     #   input_val_bin: ["data/fineweb10B/fineweb_train_*.bin"]
     # - input_bin: ["data/tokenized_owt2/train.bin"]
     #   input_val_bin: ["data/tokenized_owt2/val.bin"]
-    - input_bin: ["/p/data1/mmlaion/text-data/tokenized/c4/merged"]
-      input_val_bin: ["/p/data1/mmlaion/text-data/tokenized/c4/merged"]
+    # - input_bin: ["/p/data1/mmlaion/text-data/tokenized/c4/merged"]
+    #   input_val_bin: ["/p/data1/mmlaion/text-data/tokenized/c4/merged"]
+    - input_bin: ["/e/data1/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
+      input_val_bin: ["/e/data1/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
 
   # Model parameters
   vocab_size: [50304]
@@ -19,12 +21,12 @@ parameters:
   # router_type: ['switch', 'diff']
 
   # Optimization parameters
-  batch_size: [512]  # 8*64
+  batch_size: [32]  # 8*64
   device_batch_size: [8]  # was 16
   sequence_length: [1024]
-  num_iterations: [6000] # was 4578 before
+  num_iterations: [6] # was 4578 before
   warmup_iters: [0]
-  warmdown_iters: [1714] # was 1308 before
+  warmdown_iters: [0] # was 1308 before
   weight_decay: [0.0]
   use_adamw_opt3: [false]
   # Learning rate parameters
@@ -42,21 +44,19 @@ parameters:
   output: ["logs"]
 
   # Run config
-  device_0: [true]
+  # device_0: [true]
   seed: [1000]
 
   router_type: ['switch']
   aux_use_routed_prob: [false]
+  load_balance_ste_width: [1.0]
   global_load_balance: [false]
+  load_balance_loss: ['fsq']
 
-  LIST_EXPS:
-  - aux_coeff_train: [0.01]
-    aux_coeff_val: [0.01]
-  - aux_coeff_train: [0.001]
-    aux_coeff_val: [0.001]
-  - aux_coeff_train: [0.0002]
-    aux_coeff_val: [0.0002]
+  LIST_COEFS:
+    - aux_coeff_train: [0.1]
+      aux_coeff_val: [0.1]
   
   top_k: [16]
-  num_experts: [256]
-  hidden_dim_scale_factor: [0.125]
+  num_experts: [64]
+  hidden_dim_scale_factor: [0.5]

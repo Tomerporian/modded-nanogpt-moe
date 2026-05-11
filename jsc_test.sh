@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --account=reformo
-#SBATCH --nodes=2
-#SBATCH --ntasks-per-node=4
-#SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=12
-#SBATCH --time=480
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=2
+#SBATCH --gpus-per-node=2
+#SBATCH --cpus-per-task=4
+#SBATCH --time=30
 #SBATCH --partition=booster
 #SBATCH --threads-per-core=1
 #SBATCH --job-name=nanogpt_moe

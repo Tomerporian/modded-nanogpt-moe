@@ -250,7 +250,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated lm-eval tasks (default: hellaswag).",
     )
     parser.add_argument("--batch-size", type=int, default=1, help="Eval batch size.")
-    parser.add_argument("--tokenizer-name", default="gpt2", help="Tokenizer name or path.")
+    parser.add_argument("--tokenizer-name", default="EleutherAI/gpt-neox-20b", help="Tokenizer name or path.")
     parser.add_argument(
         "--results-file",
         default=None,

@@ -1,6 +1,6 @@
 job_details:
-  name: sq_metrics_lb
-  output_dir: logs/seeds_and_datasets
+  name: isolate_ste_width
+  output_dir: /e/project1/laionize/shechter1/checkpoints/modded-nanogpt-moe/
 
 parameters:
   LIST_DATASETS:
@@ -8,8 +8,10 @@ parameters:
     #   input_val_bin: ["data/fineweb10B/fineweb_train_*.bin"]
     # - input_bin: ["data/tokenized_owt2/train.bin"]
     #   input_val_bin: ["data/tokenized_owt2/val.bin"]
-    - input_bin: ["/p/data1/mmlaion/text-data/tokenized/c4/merged"]
-      input_val_bin: ["/p/data1/mmlaion/text-data/tokenized/c4/merged"]
+    # - input_bin: ["/p/data1/mmlaion/text-data/tokenized/c4/merged"]
+    #   input_val_bin: ["/p/data1/mmlaion/text-data/tokenized/c4/merged"]
+    - input_bin: ["/e/data1/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
+      input_val_bin: ["/e/data1/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
 
   # Model parameters
   vocab_size: [50304]
@@ -42,26 +44,63 @@ parameters:
   output: ["logs"]
 
   # Run config
-  device_0: [true]
+  # device_0: [true]
   seed: [1000]
 
   router_type: ['switch']
   aux_use_routed_prob: [false]
-  load_balance_ste_width: [1.0]
-  global_load_balance: [false]
-  load_balance_loss: ['fsq', 'maxviosq']
 
-  LIST_COEFS:
-    - aux_coeff_train: [0.1]
-      aux_coeff_val: [0.1]
-    - aux_coeff_train: [0.01]
-      aux_coeff_val: [0.01]
-    - aux_coeff_train: [0.001]
-      aux_coeff_val: [0.001]
-    - aux_coeff_train: [0.0001]
-      aux_coeff_val: [0.0001]
+  global_load_balance: [false]
+
+  # load_balance_ste_width: [0.001, 0.01, 0.1, 1.0, 10.0]
   
-  top_k: [16,2]
+
+  LIST_EXPS:
+    - load_balance_loss: ['maxvio']
+      aux_coeff_train: [0.001]
+      aux_coeff_val: [0.001]
+      load_balance_ste_width: [1.0]
+    - load_balance_loss: ['maxvio']
+      aux_coeff_train: [0.0001]
+      aux_coeff_val: [0.0001]
+      load_balance_ste_width: [0.1]
+    - load_balance_loss: ['maxvio']
+      aux_coeff_train: [0.00001]
+      aux_coeff_val: [0.00001]
+      load_balance_ste_width: [0.01]
+    - load_balance_loss: ['maxvio']
+      aux_coeff_train: [0.000001]
+      aux_coeff_val: [0.000001]
+      load_balance_ste_width: [0.001]
+    - load_balance_loss: ['maxvio']
+      aux_coeff_train: [0.01]
+      aux_coeff_val: [0.01]
+      load_balance_ste_width: [10.0]
+    - load_balance_loss: ['centered_fsq']
+      aux_coeff_train: [0.01]
+      aux_coeff_val: [0.01]
+      load_balance_ste_width: [1.0]
+    - load_balance_loss: ['centered_fsq']
+      aux_coeff_train: [0.001]
+      aux_coeff_val: [0.001]
+      load_balance_ste_width: [0.1]
+    - load_balance_loss: ['centered_fsq']
+      aux_coeff_train: [0.0001]
+      aux_coeff_val: [0.0001]
+      load_balance_ste_width: [0.01]
+    - load_balance_loss: ['centered_fsq']
+      aux_coeff_train: [0.00001]
+      aux_coeff_val: [0.00001]
+      load_balance_ste_width: [0.001]
+    - load_balance_loss: ['centered_fsq']
+      aux_coeff_train: [0.1]
+      aux_coeff_val: [0.1]
+      load_balance_ste_width: [10.0]
+
+
+
+  
+  top_k: [16]
   num_experts: [64]
   hidden_dim_scale_factor: [0.5]
 

@@ -18,7 +18,6 @@ parameters:
   n_layer: [12]
   n_head: [6] # change to 12?
   n_embd: [768]
-  # router_type: ['switch', 'diff']
 
   # Optimization parameters
   batch_size: [512]  # 8*64
@@ -104,17 +103,3 @@ parameters:
   num_experts: [64]
   hidden_dim_scale_factor: [0.5]
 
-  # LIST_EXPERT_SIZES:
-  #   - num_experts: [64]
-  #     top_k: [16]
-  #     hidden_dim_scale_factor: [0.5]
-  #   - num_experts: [64]
-  #     top_k: [2]
-  #     hidden_dim_scale_factor: [0.5]
-
-    # - num_experts: [128]
-    #   top_k: [32]
-    #   hidden_dim_scale_factor: [0.25]
-    # - num_experts: [128]
-    #   top_k: [4]
-    #   hidden_dim_scale_factor: [0.25]

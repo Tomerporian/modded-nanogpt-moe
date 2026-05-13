@@ -177,6 +177,9 @@ def _build_training_parser():
                        help='every how many steps to save the checkpoint? 0 for only at the end')
     group.add_argument('--save-only-latest', action='store_true', default=False,
                        help='if set, remove the previous checkpoint after saving a new one')
+    group.add_argument('--save-pre-decay', action='store_true', default=True,
+                       help='if set, always keep the last checkpoint before lr warmdown (pre-decay); '
+                            'useful for resuming with constant lr; only meaningful with --save-only-latest')
     group.add_argument('--n-tracked-seq', default=100, type=int,
                        help='number of sequences to track for expert assignment changes')
     group.add_argument('--wandb-project', default='modded-nanogpt-moe', type=str,

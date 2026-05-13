@@ -219,6 +219,13 @@ if args.use_swa:
     if getattr(args, 'swa_eval_during_val', False) or getattr(args, 'swa_eval_final', False):
         swa_model = torch.compile(swa_model)
 
+# step at which LR warmdown begins (None if no warmdown configured)
+decay_start_step = (
+    args.num_iterations - args.warmdown_iters
+    if args.warmdown_iters > 0 and args.warmdown_iters < args.num_iterations
+    else None
+)
+
 # init the scheduler(s)
 scheduler_type = SCHEDULER_TYPE[args.lr_scheduler]
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, lambda it: scheduler_type(args, it, min_lr=args.min_lr)) for opt in optimizers]
@@ -294,6 +301,12 @@ last_checkpoint_path = (
     if args.save_only_latest and resolved_resume_path and os.path.isfile(resolved_resume_path)
     else None
 )
+# path of the checkpoint we must never delete (last step before lr decay)
+pre_decay_checkpoint_path = (
+    os.path.join(args.output, f'state_step{decay_start_step:06d}.pt')
+    if args.save_pre_decay and decay_start_step is not None
+    else None
+)
 
 # begin logging
 if master_process:
@@ -366,6 +379,7 @@ t0 = time.time()
 # begin training
 for step in range(start_step, args.num_iterations + 1):
     last_step = (step == args.num_iterations)
+    is_pre_decay_step = (decay_start_step is not None and step == decay_start_step and not last_step)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
     # steps with dummy data first, and then re-initialize the model and reset the loader.
@@ -658,7 +672,12 @@ for step in range(start_step, args.num_iterations + 1):
         torch.cuda.synchronize()
         t0 = time.time()
 
-    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+    should_save = (
+        last_step
+        or (args.save_every > 0 and step % args.save_every == 0)
+        or is_pre_decay_step
+    )
+    if master_process and should_save:
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
@@ -680,10 +699,12 @@ for step in range(start_step, args.num_iterations + 1):
                 logging.warning(f"Failed to serialize SWA state: {e}")
         checkpoint_path = os.path.join(args.output, f'state_step{step:06d}.pt')
         torch.save(log, checkpoint_path)
-        if args.save_only_latest and (last_step or args.save_every > 0):
+        if args.save_only_latest and (last_step or args.save_every > 0 or is_pre_decay_step):
             previous_checkpoint = last_checkpoint_path
             last_checkpoint_path = checkpoint_path
-            if previous_checkpoint and previous_checkpoint != checkpoint_path:
+            if (previous_checkpoint
+                    and previous_checkpoint != checkpoint_path
+                    and previous_checkpoint != pre_decay_checkpoint_path):
                 try:
                     os.remove(previous_checkpoint)
                 except OSError as err:

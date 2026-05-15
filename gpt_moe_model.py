@@ -248,7 +248,8 @@ class RectIndicatorSTE(torch.autograd.Function):
         (margin,) = ctx.saved_tensors
         half_width = ctx.bandwidth * 0.5
         window = (margin.float().abs() < half_width).to(dtype=torch.float32)
-        grad_margin = grad_output.float() * window / ctx.bandwidth
+        # grad_margin = grad_output.float() * window / ctx.bandwidth
+        grad_margin = grad_output.float() * window
         return grad_margin.to(dtype=margin.dtype), None
 
 

@@ -188,6 +188,24 @@ def _build_training_parser():
                        help='log max attention logits (extra matmul cost)')
     group.add_argument('--output', default='logs', type=str,
                        help='output directory for logs and checkpoints')
+    group.add_argument('--task-eval-every', default=0, type=int,
+                       help='evaluate downstream task losses every N training steps; 0 = every validation, -1 disables')
+    group.add_argument('--task-eval-tasks', default='dclm-core-22', type=str,
+                       help='comma-separated lm-eval task names, or dclm-core-22')
+    group.add_argument('--task-eval-max-examples', default=1000, type=int,
+                       help='max examples per task for downstream task loss eval')
+    group.add_argument('--task-eval-batch-size', default=0, type=int,
+                       help='batch size for rank-0 downstream task loss eval; 0 = use device-batch-size')
+    group.add_argument('--task-eval-tokenizer', default='EleutherAI/gpt-neox-20b', type=str,
+                       help='tokenizer used for downstream task loss eval')
+    group.add_argument('--task-eval-hf-home',
+                       default='/e/data1/datasets/playground/mmlaion/shared/oellm_shared_evals',
+                       type=str,
+                       help='read-only/shared HF cache that contains lm-eval datasets')
+    group.add_argument('--task-eval-writable-hf-home', default='', type=str,
+                       help='writable HF cache for task eval locks and temp files; defaults to XDG_CACHE_HOME/huggingface')
+    group.add_argument('--task-eval-sync-timeout-sec', default=7200, type=float,
+                       help='timeout for file-based rank sync around rank-0 task eval')
 
     # Loss parameters
     group = parser.add_argument_group('Loss parameters')

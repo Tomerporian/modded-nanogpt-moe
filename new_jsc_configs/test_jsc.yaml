@@ -1,0 +1,51 @@
+job_details:
+  name: test_evals
+  output_dir: /e/project1/laionize/shechter1/checkpoints/modded-nanogpt-moe/
+
+parameters:
+  LIST_DATASETS:
+    - input_bin: ["/e/data1/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
+      input_val_bin: ["/e/data1/datasets/products/mmlaion/language/tokenized/C4/GPT-NeoX/merged"]
+
+  vocab_size: [50304]
+  n_layer: [6]
+  n_head: [4]
+  n_embd: [32]
+
+  batch_size: [8]
+  device_batch_size: [2]
+  sequence_length: [64]
+  num_iterations: [100]
+  warmup_iters: [0]
+  warmdown_iters: [0]
+  weight_decay: [0.0]
+  use_adamw_opt3: [false]
+
+  lr_embed: [0.3]
+  lr_head: [0.002]
+  lr_muon: [0.02]
+  momentum: [0.95]
+
+  val_loss_every: [5]
+  val_tokens: [1024]
+  save_every: [5]
+  save_only_latest: [true]
+  wandb_project: ["modded-nanogpt-moe-test"]
+  output: ["logs"]
+
+  task_eval_every: [0]
+  task_eval_max_examples: [20]
+  task_eval_hf_home: ["/e/data1/datasets/playground/mmlaion/shared/oellm_shared_evals"]
+
+  seed: [1000]
+  router_type: ['switch']
+  aux_use_routed_prob: [false]
+
+  LIST_EXPS:
+    - load_balance_loss: ['switch']
+      aux_coeff_train: [0.01]
+      aux_coeff_val: [0.01]
+
+  top_k: [2]
+  num_experts: [8]
+  hidden_dim_scale_factor: [0.5]

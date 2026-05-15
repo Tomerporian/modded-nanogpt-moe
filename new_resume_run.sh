@@ -1,6 +1,6 @@
 #!/bin/bash
 
-cd /e/scratch/reformo/shechter1/repos/modded-nanogpt-moe
+cd /e/project1/laionize/shechter1/repos/modded-nanogpt-moe
 
 if [[ $# -ne 1 ]]; then
   echo "Usage: $0 RESUME_DIR" >&2
@@ -34,4 +34,4 @@ else
 fi
 
 sbatch "${SBATCH_ARGS[@]}" \
-  --wrap="bash -lc 'cd /e/scratch/reformo/shechter1/repos/modded-nanogpt-moe && export SCRATCH_HOME=/e/scratch/reformo/shechter1 && export CONDA_PREFIX=/e/scratch/reformo/shechter1/miniforge3/envs/lb && export PATH=\$CONDA_PREFIX/bin:\$SCRATCH_HOME/miniforge3/condabin:\$PATH && python submit_multiple.py \"$RESUME_DIR\" -s run_moe.sh -r -y'"
+  --wrap="bash -lc 'cd /e/project1/laionize/shechter1/repos/modded-nanogpt-moe && export SCRATCH_HOME=/e/project1/laionize/shechter1 && export CONDA_PREFIX=/e/project1/laionize/shechter1/miniforge3/envs/lb && export PATH=\$CONDA_PREFIX/bin:\$SCRATCH_HOME/miniforge3/condabin:\$PATH && python submit_multiple.py \"$RESUME_DIR\" -s run_moe.sh -r -y'"

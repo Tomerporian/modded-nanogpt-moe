@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --account=reformo
-#SBATCH --nodes=8
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=12
-#SBATCH --time=480
+#SBATCH --time=60
 #SBATCH --partition=booster
 #SBATCH --threads-per-core=1
 #SBATCH --job-name=nanogpt_moe
@@ -74,25 +74,8 @@ srun --export=ALL bash -c '
     export RANK=$SLURM_PROCID
     export LOCAL_RANK=$SLURM_LOCALID
     export WORLD_SIZE=$SLURM_NTASKS
-    if [ -n "${SLURM_TMPDIR:-}" ]; then
-        COMPILE_TMPDIR="${SLURM_TMPDIR}/modded-nanogpt-moe"
-    else
-        COMPILE_TMPDIR="/tmp/${USER}/modded-nanogpt-moe"
-    fi
-    export TORCHINDUCTOR_CACHE_DIR="${COMPILE_TMPDIR}/torchinductor/job_${SLURM_JOB_ID}/rank_${SLURM_PROCID}"
-    export TRITON_CACHE_DIR="${COMPILE_TMPDIR}/triton/job_${SLURM_JOB_ID}/rank_${SLURM_PROCID}"
-    export CUDA_CACHE_PATH="${COMPILE_TMPDIR}/cuda/job_${SLURM_JOB_ID}/rank_${SLURM_PROCID}"
-    mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$CUDA_CACHE_PATH" || exit 1
-    if [ "$RANK" = "0" ]; then
-        echo "Compile cache base: $COMPILE_TMPDIR"
-    fi
     echo "Process $RANK on $(hostname): RANK=$RANK, LOCAL_RANK=$LOCAL_RANK, WORLD_SIZE=$WORLD_SIZE"
     python train_gpt_moe.py --config $CONF
 '
-srun_status=$?
-if [ $srun_status -ne 0 ]; then
-    echo "srun failed with exit code $srun_status"
-    exit $srun_status
-fi
 
 echo "Job finished."

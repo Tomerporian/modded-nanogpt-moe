@@ -31,6 +31,7 @@ from schedulers import SCHEDULER_TYPE
 from torch.optim.swa_utils import AveragedModel
 from logger import setup_default_logging
 from data.dataloaders import create_dataloader
+from task_loss_eval import TaskLossEvaluator
 from gpt_moe_model import (
     GPT,
     GPTConfig,
@@ -174,9 +175,9 @@ if hasattr(config, "coordinate_descent_tuning"):
 model = torch.compile(model)
 # here we wrap model into DDP container
 if args.device_0:
-    model = DDP(model, device_ids=[0], find_unused_parameters=True)
+    model = DDP(model, device_ids=[0], find_unused_parameters=True, broadcast_buffers=False)
 else:
-    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
+    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True, broadcast_buffers=False)
     
 raw_model = model.module # always contains the "raw" unwrapped model
 num_experts = raw_model.transformer.h[0].mlp.num_experts
@@ -371,6 +372,18 @@ else:
 
 if resume_val_loader_state is not None:
     val_loader.load_state_dict(resume_val_loader_state)
+
+task_loss_evaluator = TaskLossEvaluator.from_args(
+    args,
+    rank=ddp_rank,
+    local_rank=ddp_local_rank,
+    world_size=ddp_world_size,
+    master_process=master_process,
+    seq_len=T,
+)
+task_eval_batch_size = args.task_eval_batch_size if args.task_eval_batch_size > 0 else B
+if master_process and task_loss_evaluator.enabled:
+    logging.info(f"task_loss_eval: using batch_size={task_eval_batch_size}")
 
 training_time_ms = resume_training_time_ms
 # start the clock
@@ -597,11 +610,11 @@ for step in range(start_step, args.num_iterations + 1):
         topk_change_percentages = {}  # Dict to store changes for each k value
         any_topk_changed_percentages = []
         if master_process and tracking_x is not None:
-            model.eval()
+            raw_model.eval()
             with torch.no_grad():
                 with ctx:
                     # Get current expert assignments for tracking sequences
-                    _, _, _, _, _, _, _, _, _, _, _, _, current_assignments = model(
+                    _, _, _, _, _, _, _, _, _, _, _, _, current_assignments = raw_model(
                         tracking_x,
                         return_logits=False,
                         aux_coeff=0.0,
@@ -667,6 +680,18 @@ for step in range(start_step, args.num_iterations + 1):
                 ROUTER_VALUE_KEYS,
                 diff_weight,
             )
+
+        task_loss_evaluator.run_or_wait(
+            step=step,
+            last_step=last_step,
+            master_process=master_process,
+            raw_model=raw_model,
+            device=device,
+            ctx=ctx,
+            diff_weight=diff_weight,
+            batch_size=task_eval_batch_size,
+            log_metrics=lambda metrics: wandb.log(metrics, step=step),
+        )
 
         # start the clock again
         torch.cuda.synchronize()

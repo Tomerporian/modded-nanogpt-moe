@@ -1,26 +1,27 @@
 #!/bin/bash
 #SBATCH --account=reformo
-#SBATCH --nodes=4
-#SBATCH --ntasks-per-node=4
-#SBATCH --gpus-per-node=4
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=12
 #SBATCH --time=480
 #SBATCH --partition=booster
 #SBATCH --threads-per-core=1
-#SBATCH --job-name=lm_eval
-#SBATCH --output=/e/project1/laionize/shechter1/logs/lm-eval-%j.out
-#SBATCH --error=/e/project1/laionize/shechter1/logs/lm-eval-%j.out
+#SBATCH --job-name=task_loss_eval
+#SBATCH --output=/e/project1/laionize/shechter1/logs/task-loss-eval-%j.out
+#SBATCH --error=/e/project1/laionize/shechter1/logs/task-loss-eval-%j.out
+
+set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
     echo "Usage: sbatch $0 /path/to/run_dir"
     exit 1
 fi
 
-# --- Environment Setup ---
 export DIR_PATH="$1"
 export SCRATCH_HOME=${SCRATCH_HOME:-/e/project1/laionize/shechter1}
 export REPO_DIR=${REPO_DIR:-${SCRATCH_HOME}/repos/modded-nanogpt-moe}
-export RESULTS_BASE=${RESULTS_BASE:-${SCRATCH_HOME}/lm_eval_results}
+export RESULTS_BASE=${RESULTS_BASE:-${SCRATCH_HOME}/task_loss_results}
 export TMPDIR=${TMPDIR:-${SCRATCH_HOME}/tmp/modded-nanogpt-moe}
 export XDG_CACHE_HOME=${XDG_CACHE_HOME:-${SCRATCH_HOME}/.cache}
 export XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-${SCRATCH_HOME}/.config}
@@ -30,10 +31,6 @@ export HF_HUB_CACHE=${HF_HUB_CACHE:-${HF_HOME}/hub}
 export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-${HF_HOME}/datasets_task_loss}
 export HF_MODULES_CACHE=${HF_MODULES_CACHE:-${HF_HOME}/modules}
 export HF_EVALUATE_CACHE=${HF_EVALUATE_CACHE:-${HF_HOME}/evaluate}
-# `evaluate` writes metric scratch files with names such as
-# default_experiment-1-0.arrow. Concurrent lm-eval jobs collide if they share
-# one metrics cache, so keep this per Slurm job unless explicitly overridden.
-export HF_METRICS_CACHE=${HF_METRICS_CACHE:-${TMPDIR}/hf_metrics_cache/${SLURM_JOB_ID:-manual}}
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
@@ -49,7 +46,7 @@ export CONDA_DEFAULT_ENV=lb
 export CONDA_SHLVL=1
 export PATH=${CONDA_PREFIX}/bin:${CONDA_ROOT}/condabin:${PATH}
 
-mkdir -p "${SCRATCH_HOME}/logs" "$TMPDIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$HF_HUB_CACHE" "$HF_DATASETS_CACHE" "$HF_MODULES_CACHE" "$HF_EVALUATE_CACHE" "$HF_METRICS_CACHE" "$RESULTS_BASE"
+mkdir -p "${SCRATCH_HOME}/logs" "$TMPDIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$HF_HUB_CACHE" "$HF_DATASETS_CACHE" "$HF_MODULES_CACHE" "$HF_EVALUATE_CACHE" "$RESULTS_BASE"
 
 module load Stages/2025
 module load CUDA/12
@@ -74,26 +71,32 @@ RUN_BASENAME=$(basename "$RUN_DIR")
 INDICATIVE_DIR=${RUN_BASENAME%%+*}
 RESULT_NAME=${RESULT_NAME:-${INDICATIVE_DIR}}
 RESULT_DIR=${RESULTS_BASE}/${RESULT_NAME}
-RESULTS_FILE=${RESULT_DIR}/lm_eval_results.yaml
-LOG_FILE=${RESULT_DIR}/logfile_eval.log
-TASKS=${TASKS:-bigbench_qa_wikidata_generate_until,squadv2,arc_easy,arc_challenge,boolq,commonsense_qa,copa,hellaswag,openbookqa,piqa,winogrande,wsc273,lambada_openai,coqa,agieval_lsat_ar,bigbench_language_identification_multiple_choice,bigbench_dyck_languages_generate_until,bigbench_operators_generate_until,bigbench_repeat_copy_logic_generate_until,bigbench_cs_algorithms_generate_until}
+RESULTS_FILE=${RESULT_DIR}/task_loss_results.yaml
+LOG_FILE=${RESULT_DIR}/logfile_task_loss_eval.log
+TASKS=${TASKS:-dclm-core-22}
 BATCH_SIZE=${BATCH_SIZE:-64}
-# blimp,glue
+TASK_LOSS_MAX_EXAMPLES=${TASK_LOSS_MAX_EXAMPLES:-0}
 mkdir -p "$RESULT_DIR"
 
 echo "--- JOB DIAGNOSTICS ---"
-echo "Starting lm-eval on $SLURM_NNODES nodes with $SLURM_NTASKS total processes"
+echo "Starting task loss eval on $SLURM_NNODES nodes with $SLURM_NTASKS total processes"
 echo "Master node: $MASTER_ADDR"
 echo "MASTER_PORT: $MASTER_PORT"
 echo "Run directory: $RUN_DIR"
 echo "Result directory: $RESULT_DIR"
 echo "Tasks: $TASKS"
 echo "Batch size: $BATCH_SIZE"
+echo "Max examples: ${TASK_LOSS_MAX_EXAMPLES}"
 echo "Shared HF home: ${SHARED_HF_HOME:-<none>}"
 echo "Writable HF home: ${HF_HOME:-<default>}"
-echo "HF metrics cache: ${HF_METRICS_CACHE:-<default>}"
-if [[ -n "${LM_EVAL_LIMIT:-}" ]]; then
-    echo "Limit: $LM_EVAL_LIMIT"
+if [[ -n "${TASK_LOSS_CHECKPOINT:-}" ]]; then
+    echo "Checkpoint override: $TASK_LOSS_CHECKPOINT"
+fi
+if [[ -n "${TASK_LOSS_DIFF_WEIGHT:-}" ]]; then
+    echo "Diff weight override: $TASK_LOSS_DIFF_WEIGHT"
+fi
+if [[ -n "${TASK_LOSS_SYNC_TIMEOUT_SEC:-}" ]]; then
+    echo "Sync timeout: $TASK_LOSS_SYNC_TIMEOUT_SEC"
 fi
 echo "Python: $(command -v python)"
 python -c "import lm_eval; print(f'lm_eval: {getattr(lm_eval, \"__version__\", \"unknown\")}')"
@@ -102,30 +105,44 @@ echo "-----------------------"
 cd "$REPO_DIR"
 
 run_args=(
-    hellaswag.py
+    run_task_loss_eval.py
     --run_dir "$RUN_DIR"
     --tasks "$TASKS"
     --batch-size "$BATCH_SIZE"
+    --max-examples "$TASK_LOSS_MAX_EXAMPLES"
     --results-file "$RESULTS_FILE"
 )
+if [[ -n "${TASK_LOSS_CHECKPOINT:-}" ]]; then
+    run_args+=(--checkpoint "$TASK_LOSS_CHECKPOINT")
+fi
+if [[ -n "${TASK_LOSS_TOKENIZER:-}" ]]; then
+    run_args+=(--tokenizer-name "$TASK_LOSS_TOKENIZER")
+fi
 if [[ -n "${SHARED_HF_HOME:-}" ]]; then
     run_args+=(--shared-hf-home "$SHARED_HF_HOME")
 fi
 if [[ -n "${WRITABLE_HF_HOME:-}" ]]; then
     run_args+=(--writable-hf-home "$WRITABLE_HF_HOME")
 fi
-if [[ -n "${LM_EVAL_LIMIT:-}" ]]; then
-    run_args+=(--limit "$LM_EVAL_LIMIT")
+if [[ -n "${TASK_LOSS_DTYPE:-}" ]]; then
+    run_args+=(--dtype "$TASK_LOSS_DTYPE")
+fi
+if [[ -n "${TASK_LOSS_DIFF_WEIGHT:-}" ]]; then
+    run_args+=(--diff-weight "$TASK_LOSS_DIFF_WEIGHT")
+fi
+if [[ -n "${TASK_LOSS_SYNC_TIMEOUT_SEC:-}" ]]; then
+    run_args+=(--sync-timeout-sec "$TASK_LOSS_SYNC_TIMEOUT_SEC")
 fi
 
+set +e
 srun --export=ALL bash -c '
     export RANK=$SLURM_PROCID
     export LOCAL_RANK=$SLURM_LOCALID
     export WORLD_SIZE=$SLURM_NTASKS
     if [ -n "${SLURM_TMPDIR:-}" ]; then
-        COMPILE_TMPDIR="${SLURM_TMPDIR}/modded-nanogpt-moe-lm-eval"
+        COMPILE_TMPDIR="${SLURM_TMPDIR}/modded-nanogpt-moe-task-loss-eval"
     else
-        COMPILE_TMPDIR="/tmp/${USER}/modded-nanogpt-moe-lm-eval"
+        COMPILE_TMPDIR="/tmp/${USER}/modded-nanogpt-moe-task-loss-eval"
     fi
     export TORCHINDUCTOR_CACHE_DIR="${COMPILE_TMPDIR}/torchinductor/job_${SLURM_JOB_ID}/rank_${SLURM_PROCID}"
     export TRITON_CACHE_DIR="${COMPILE_TMPDIR}/triton/job_${SLURM_JOB_ID}/rank_${SLURM_PROCID}"
@@ -138,6 +155,7 @@ srun --export=ALL bash -c '
     python "$@"
 ' bash "${run_args[@]}" > "$LOG_FILE" 2>&1
 srun_status=$?
+set -e
 if [ $srun_status -ne 0 ]; then
     echo "srun failed with exit code $srun_status"
     exit $srun_status

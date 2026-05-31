@@ -1,6 +1,8 @@
+import os
 import re
 import sys
 import time
+from datetime import timedelta
 from dataclasses import MISSING, fields
 from pathlib import Path
 from typing import Any
@@ -8,13 +10,26 @@ from typing import Any
 import argparse
 import torch
 import yaml
+from accelerate import Accelerator, InitProcessGroupKwargs
 from loguru import logger
 from lm_eval import evaluator
 from lm_eval.models.huggingface import HFLM
-from transformers import AutoTokenizer, PretrainedConfig, PreTrainedModel
+from transformers import AutoTokenizer, GenerationMixin, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from gpt_moe_model import GPT, GPTConfig
+from task_loss_eval import configure_hf_caches
+
+
+def _distributed_world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def _make_accelerator() -> Accelerator | None:
+    if _distributed_world_size() <= 1:
+        return None
+    kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
+    return Accelerator(kwargs_handlers=[kwargs])
 
 
 def _load_run_args(run_dir: Path) -> dict[str, Any]:
@@ -137,6 +152,7 @@ def _to_serializable(obj: Any) -> Any:
 
 class CustomConfig(PretrainedConfig):
     model_type = "modded_nanogpt_moe"
+    has_no_defaults_at_init = True
 
     def __init__(
         self,
@@ -153,6 +169,8 @@ class CustomConfig(PretrainedConfig):
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
+            is_decoder=True,
+            is_encoder_decoder=False,
         )
         self.vocab_size = vocab_size
         self.n_positions = n_positions
@@ -162,12 +180,23 @@ class CustomConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
 
 
-class CustomModel(PreTrainedModel):
+class CustomModel(PreTrainedModel, GenerationMixin):
     config_class = CustomConfig
 
     def __init__(self, config: CustomConfig, model: GPT):
         super().__init__(config)
         self.model = model
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        **_: Any,
+    ) -> dict[str, torch.Tensor]:
+        inputs = {"input_ids": input_ids}
+        if attention_mask is not None:
+            inputs["attention_mask"] = attention_mask
+        return inputs
 
     def forward(
         self,
@@ -222,6 +251,81 @@ def _configure_tokenizer(name: str, context_length: int) -> AutoTokenizer:
     return tokenizer
 
 
+def _hub_repo_cache_name(repo_id: str) -> str | None:
+    if Path(repo_id).exists() or "/" not in repo_id:
+        return None
+    return "models--" + repo_id.replace("/", "--")
+
+
+def _mirror_shared_hub_repo(shared_hf_home: str | None, repo_id: str) -> None:
+    repo_cache_name = _hub_repo_cache_name(repo_id)
+    if not shared_hf_home or repo_cache_name is None:
+        return
+
+    source = Path(shared_hf_home).expanduser().resolve() / "hub" / repo_cache_name
+    if not source.exists():
+        logger.warning(f"Shared HF hub repo not found: {source}")
+        return
+
+    hub_cache = Path(os.environ["HF_HUB_CACHE"]).expanduser().resolve()
+    target = hub_cache / repo_cache_name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() or target.is_symlink():
+        return
+    target.symlink_to(source, target_is_directory=True)
+    logger.info(f"Linked shared HF hub repo {source} -> {target}")
+
+
+def _link_shared_cache_dir(source: Path, target: Path) -> None:
+    if not source.exists():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() or target.is_symlink():
+        return
+    try:
+        target.symlink_to(source, target_is_directory=True)
+    except FileExistsError:
+        # Multiple one-GPU eval jobs can initialize the same writable cache at
+        # once. If another job won the race, this cache link is ready to use.
+        if target.exists() or target.is_symlink():
+            return
+        raise
+    logger.info(f"Linked shared cache {source} -> {target}")
+
+
+def _configure_auxiliary_hf_caches(
+    shared_hf_home: str | None,
+    writable_hf_home: str,
+) -> None:
+    writable_root = Path(writable_hf_home).expanduser().resolve()
+    modules_cache = Path(
+        os.environ.setdefault("HF_MODULES_CACHE", str(writable_root / "modules"))
+    ).expanduser().resolve()
+    evaluate_cache = Path(
+        os.environ.setdefault("HF_EVALUATE_CACHE", str(writable_root / "evaluate"))
+    ).expanduser().resolve()
+    metrics_cache = Path(
+        os.environ.setdefault("HF_METRICS_CACHE", str(writable_root / "metrics"))
+    ).expanduser().resolve()
+    os.environ.setdefault("HF_EVALUATE_OFFLINE", "1")
+
+    for path in (modules_cache, evaluate_cache, metrics_cache):
+        path.mkdir(parents=True, exist_ok=True)
+
+    if not shared_hf_home:
+        return
+
+    shared_root = Path(shared_hf_home).expanduser().resolve()
+    _link_shared_cache_dir(
+        shared_root / "modules" / "evaluate_modules",
+        modules_cache / "evaluate_modules",
+    )
+    _link_shared_cache_dir(
+        shared_root / "evaluate" / "downloads",
+        evaluate_cache / "downloads",
+    )
+
+
 def _default_results_path(run_dir: Path, tasks: list[str]) -> Path:
     if len(tasks) == 1:
         filename = f"{tasks[0]}.yaml"
@@ -252,6 +356,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=1, help="Eval batch size.")
     parser.add_argument("--tokenizer-name", default="EleutherAI/gpt-neox-20b", help="Tokenizer name or path.")
     parser.add_argument(
+        "--shared-hf-home",
+        default=None,
+        help="Read-only HF cache root with hub/ and datasets/ (default: task_eval_hf_home from args.yaml).",
+    )
+    parser.add_argument(
+        "--writable-hf-home",
+        default=None,
+        help="Writable HF cache root for offline symlinks (default: task_eval_writable_hf_home, HF_HOME, or XDG cache).",
+    )
+    parser.add_argument(
         "--results-file",
         default=None,
         help="Output YAML filename (default: <task>.yaml or lm_eval_results.yaml).",
@@ -266,6 +380,10 @@ def main(args: argparse.Namespace) -> None:
 
     logger.remove()
     logger.add(sys.stderr, level=args.log_level.upper())
+    accelerator = _make_accelerator()
+    rank = accelerator.process_index if accelerator is not None else 0
+    local_rank = accelerator.local_process_index if accelerator is not None else 0
+    world_size = accelerator.num_processes if accelerator is not None else 1
 
     run_path = Path(args.run_dir).expanduser().resolve()
     if not run_path.is_dir():
@@ -274,6 +392,30 @@ def main(args: argparse.Namespace) -> None:
     checkpoint_path = _resolve_checkpoint(run_path, args.checkpoint)
     train_args = _load_run_args(run_path)
     gpt_config = _build_gpt_config(train_args)
+
+    task_list = [task.strip() for task in args.tasks.split(",") if task.strip()]
+    if not task_list:
+        raise ValueError("At least one task must be provided")
+
+    shared_hf_home = (
+        args.shared_hf_home
+        or train_args.get("task_eval_hf_home")
+        or os.environ.get("SHARED_HF_HOME")
+    )
+    writable_hf_home = (
+        args.writable_hf_home
+        or train_args.get("task_eval_writable_hf_home")
+        or os.environ.get("HF_HOME")
+    )
+    configured_hf_home = configure_hf_caches(
+        shared_hf_home=shared_hf_home or None,
+        writable_hf_home=writable_hf_home or None,
+        task_names=task_list,
+    )
+    logger.info(f"Using HF_HOME={configured_hf_home}")
+    _configure_auxiliary_hf_caches(shared_hf_home, configured_hf_home)
+    if shared_hf_home:
+        _mirror_shared_hub_repo(shared_hf_home, args.tokenizer_name)
 
     context_length = int(train_args.get("sequence_length", 1024))
     tokenizer = _configure_tokenizer(args.tokenizer_name, context_length)
@@ -289,12 +431,15 @@ def main(args: argparse.Namespace) -> None:
         pad_token_id=tokenizer.pad_token_id,
     )
 
-    target_device = torch.device(
-        args.device
-        if args.device is not None
-        else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    logger.info(f"Using device {target_device}")
+    if accelerator is not None:
+        target_device = torch.device(accelerator.device)
+    else:
+        target_device = torch.device(
+            args.device
+            if args.device is not None
+            else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+    logger.info(f"Using device {target_device} (rank {rank}/{world_size}, local_rank {local_rank})")
 
     state_dict = _normalize_state_dict(_load_model_state(checkpoint_path, map_location="cpu"))
     base_model = GPT(gpt_config)
@@ -310,16 +455,17 @@ def main(args: argparse.Namespace) -> None:
     hf_model = CustomModel(hf_config, base_model).to(target_device)
     hf_model.eval()
 
-    task_list = [task.strip() for task in args.tasks.split(",") if task.strip()]
-    if not task_list:
-        raise ValueError("At least one task must be provided")
-
     wrapped_model = HFLM(
         pretrained=hf_model,
         tokenizer=tokenizer,
         batch_size=args.batch_size,
         device=str(target_device),
     )
+    if accelerator is not None:
+        wrapped_model.accelerator = accelerator
+        wrapped_model._rank = accelerator.process_index
+        wrapped_model._world_size = accelerator.num_processes
+        wrapped_model._device = target_device
 
     start = time.time()
     logger.info(f"Running lm-eval on tasks: {task_list}")
@@ -331,6 +477,9 @@ def main(args: argparse.Namespace) -> None:
     )
     elapsed = time.time() - start
     logger.info(f"Evaluation finished in {elapsed:.2f}s")
+    if results_raw is None:
+        logger.info(f"Rank {rank} completed; rank 0 will write results.")
+        return
 
     for task in task_list:
         task_metrics = results_raw["results"].get(task, {})

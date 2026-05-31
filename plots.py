@@ -40,7 +40,7 @@ def _import_pandas():
         import pandas as pd
     except ImportError as exc:
         raise ImportError(
-            "pandas is required to build lm-eval result tables. Install pandas "
+            "pandas is required to build result tables. Install pandas "
             "or call this helper where pandas is available."
         ) from exc
     return pd
@@ -51,7 +51,7 @@ def _import_yaml():
         import yaml
     except ImportError as exc:
         raise ImportError(
-            "pyyaml is required to read lm-eval YAML results. Install pyyaml "
+            "pyyaml is required to read YAML results. Install pyyaml "
             "or call this helper where yaml is available."
         ) from exc
     return yaml
@@ -444,17 +444,216 @@ _DEFAULT_LM_EVAL_BENCHMARKS: Tuple[Dict[str, Any], ...] = (
     },
 )
 
+_DCLM_CORE_LM_EVAL_TASKS: Tuple[str, ...] = (
+    "arc_easy",
+    "arc_challenge",
+    "boolq",
+    "commonsense_qa",
+    "copa",
+    "hellaswag",
+    "openbookqa",
+    "piqa",
+    "winogrande",
+    "wsc273",
+    "lambada_openai",
+    "coqa",
+    "squadv2",
+    "agieval_lsat_ar",
+    "bigbench_language_identification_multiple_choice",
+    "bigbench_qa_wikidata_generate_until",
+    "bigbench_dyck_languages_generate_until",
+    "bigbench_operators_generate_until",
+    "bigbench_repeat_copy_logic_generate_until",
+    "bigbench_cs_algorithms_generate_until",
+)
+
 _DEFAULT_LM_EVAL_TASK_METRICS: Dict[str, Tuple[str, ...]] = {
+    "agieval_lsat_ar": ("acc_norm,none", "acc,none"),
     "arc_challenge": ("acc_norm,none", "acc,none"),
     "arc_easy": ("acc_norm,none", "acc,none"),
+    "boolq": ("acc,none",),
+    "commonsense_qa": ("acc,none",),
+    "copa": ("acc,none",),
+    "coqa": ("f1,none", "em,none"),
     "hellaswag": ("acc_norm,none", "acc,none"),
+    "openbookqa": ("acc_norm,none", "acc,none"),
     "piqa": ("acc_norm,none", "acc,none"),
+    "squadv2": ("f1,none", "exact,none", "best_f1,none", "best_exact,none"),
+    "wsc273": ("acc,none",),
     "winogrande": ("acc,none",),
     "lambada_openai": ("acc,none",),
+    "bigbench_cs_algorithms_generate_until": ("exact_match,none",),
+    "bigbench_dyck_languages_generate_until": ("exact_match,none",),
+    "bigbench_language_identification_multiple_choice": ("acc,none",),
+    "bigbench_operators_generate_until": ("exact_match,none",),
+    "bigbench_qa_wikidata_generate_until": ("exact_match,none",),
+    "bigbench_repeat_copy_logic_generate_until": ("exact_match,none",),
     "cola": ("mcc,none", "acc,none"),
     "mrpc": ("f1,none", "acc,none"),
     "qqp": ("f1,none", "acc,none"),
 }
+
+_DEFAULT_LM_EVAL_METADATA_KEYS: Tuple[str, ...] = (
+    "config_label",
+    "load_balance_loss",
+    "aux_coeff_train",
+    "aux_coeff_val",
+    "load_balance_ste_width",
+    "loss_free_mode",
+    "loss_free_update_rate",
+    "approx_global_load_balance",
+    "topk_activation",
+)
+
+_DEFAULT_TASK_LOSS_RESULTS_ROOTS: Tuple[str, ...] = (
+    "/e/project1/laionize/shechter1/task_loss_results/26-05-14-baselines",
+    "/e/project1/laionize/shechter1/task_loss_results/26-05-15-centered_fsq",
+)
+
+_DEFAULT_TASK_LOSS_METADATA_KEYS: Tuple[str, ...] = (
+    "config_label",
+    "load_balance_loss",
+    "seed",
+    "aux_coeff_train",
+    "aux_coeff_val",
+    "load_balance_ste_width",
+    "loss_free_mode",
+    "loss_free_update_rate",
+    "approx_global_load_balance",
+    "topk_activation",
+)
+
+
+def _as_path_list(value: Union[str, Path, Sequence[Union[str, Path]], None]) -> list[Path]:
+    if value is None:
+        return []
+    if isinstance(value, (str, Path)):
+        return [Path(value)]
+    return [Path(item) for item in value]
+
+
+def _natural_sort_key(value: Union[str, Path]) -> list[Any]:
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", str(value))
+    ]
+
+
+def _collect_lm_eval_result_paths(
+    results_root: Union[str, Path, Sequence[Union[str, Path]]],
+    *,
+    result_filename: str,
+    run_paths: Optional[Sequence[Union[str, Path]]],
+    recursive: bool,
+) -> list[Path]:
+    if run_paths is not None:
+        paths = []
+        for run_path in run_paths:
+            path = Path(run_path)
+            if path.is_dir():
+                path = path / result_filename
+            paths.append(path)
+    else:
+        paths = []
+        pattern = f"**/{result_filename}" if recursive else f"*/{result_filename}"
+        for root in _as_path_list(results_root):
+            root = root.expanduser()
+            if root.is_file():
+                paths.append(root)
+            else:
+                paths.extend(root.glob(pattern))
+
+    unique_paths = {path.expanduser().resolve() for path in paths if path.exists()}
+    return sorted(unique_paths, key=_natural_sort_key)
+
+
+def _lm_eval_result_group_and_run(path: Union[str, Path]) -> Tuple[str, str]:
+    path = Path(path)
+    run_name = path.parent.name
+    group_name = path.parent.parent.name
+    return group_name, run_name
+
+
+def _lm_eval_run_id(path: Union[str, Path]) -> str:
+    group_name, run_name = _lm_eval_result_group_and_run(path)
+    return f"{group_name}/{run_name}" if group_name else run_name
+
+
+def _load_yaml_mapping(path: Union[str, Path]) -> Dict[str, Any]:
+    yaml = _import_yaml()
+    with Path(path).open("r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Expected a YAML mapping in {path}")
+    return loaded
+
+
+def _find_checkpoint_config_path(
+    result_path: Union[str, Path],
+    checkpoint_roots: Sequence[Union[str, Path]],
+) -> Optional[Path]:
+    group_name, run_name = _lm_eval_result_group_and_run(result_path)
+    for root in _as_path_list(checkpoint_roots):
+        candidates = (
+            root / group_name / run_name / "args.yaml",
+            root / group_name / run_name / "spec.yaml",
+            root / run_name / "args.yaml",
+            root / run_name / "spec.yaml",
+        )
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def _load_lm_eval_run_metadata(
+    result_path: Union[str, Path],
+    checkpoint_roots: Sequence[Union[str, Path]],
+) -> Dict[str, Any]:
+    config_path = _find_checkpoint_config_path(result_path, checkpoint_roots)
+    if config_path is None:
+        return {}
+    metadata = _load_yaml_mapping(config_path)
+    metadata["_config_path"] = str(config_path)
+    return metadata
+
+
+def _collect_done_checkpoint_run_dirs(
+    checkpoint_roots: Sequence[Union[str, Path]],
+) -> Dict[str, Path]:
+    done_runs: Dict[str, Path] = {}
+    for root in _as_path_list(checkpoint_roots):
+        for done_file in sorted(root.glob("*/done"), key=_natural_sort_key):
+            run_dir = done_file.parent
+            done_runs[f"{root.name}/{run_dir.name}"] = run_dir
+        for done_file in sorted(root.glob("*/*/done"), key=_natural_sort_key):
+            run_dir = done_file.parent
+            done_runs[f"{run_dir.parent.name}/{run_dir.name}"] = run_dir
+    return done_runs
+
+
+def _format_lm_eval_metadata_value(value: Any) -> Any:
+    if isinstance(value, float):
+        return f"{value:g}"
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(item) for item in value)
+    return value
+
+
+def _lm_eval_metric_value_scale(task_name: str, metric_key: str) -> float:
+    metric_name = metric_key.split(",", 1)[0]
+    if task_name == "squadv2" and metric_name in {
+        "exact",
+        "f1",
+        "HasAns_exact",
+        "HasAns_f1",
+        "NoAns_exact",
+        "NoAns_f1",
+        "best_exact",
+        "best_f1",
+    }:
+        return 0.01
+    return 1.0
 
 
 def _load_lm_eval_results_block(path: Union[str, Path]) -> Dict[str, Dict[str, Any]]:
@@ -499,11 +698,11 @@ def _lm_eval_stderr_key(metric_key: str) -> str:
     return f"{metric_key}_stderr"
 
 
-def _select_lm_eval_metric(
+def _select_lm_eval_metric_with_key(
     task_name: str,
     metrics: Mapping[str, Any],
     metric_preferences: Sequence[str],
-) -> Tuple[float, Optional[float]]:
+) -> Tuple[float, Optional[float], str]:
     keys = list(_DEFAULT_LM_EVAL_TASK_METRICS.get(task_name, ()))
     keys.extend(key for key in metric_preferences if key not in keys)
 
@@ -516,12 +715,30 @@ def _select_lm_eval_metric(
                 if isinstance(stderr, (int, float)) and math.isfinite(float(stderr))
                 else None
             )
-            return float(value), stderr_value
+            scale = _lm_eval_metric_value_scale(task_name, key)
+            return (
+                float(value) * scale,
+                stderr_value * scale if stderr_value is not None else None,
+                key,
+            )
 
     raise KeyError(
         f"Could not find any supported metric for {task_name}. "
         f"Available keys: {sorted(metrics)}"
     )
+
+
+def _select_lm_eval_metric(
+    task_name: str,
+    metrics: Mapping[str, Any],
+    metric_preferences: Sequence[str],
+) -> Tuple[float, Optional[float]]:
+    value, stderr, _ = _select_lm_eval_metric_with_key(
+        task_name,
+        metrics,
+        metric_preferences,
+    )
+    return value, stderr
 
 
 def _lm_eval_tasks_for_spec(
@@ -573,75 +790,177 @@ def _format_lm_eval_score(
     return formatted
 
 
-def make_lm_eval_results_table(
-    results_root: Union[str, Path] = "/e/scratch/reformo/shechter1/lm_eval_results",
+def _lm_eval_score_cell(
+    value: Optional[float],
+    stderr: Optional[float],
     *,
-    result_filename: str = "lm_eval_results.yaml",
+    decimals: int,
+    percent: bool,
+    show_stderr: bool,
+    pm_symbol: str,
+    format_scores: bool,
+) -> Any:
+    if format_scores or show_stderr:
+        return _format_lm_eval_score(
+            value,
+            stderr,
+            decimals=decimals,
+            percent=percent,
+            show_stderr=show_stderr,
+            pm_symbol=pm_symbol,
+        )
+    if value is None:
+        return np.nan
+    scale = 100.0 if percent else 1.0
+    return round(value * scale, decimals)
+
+
+def _ordered_lm_eval_tasks(
+    result_sets: Sequence[Tuple[str, Path, Mapping[str, Mapping[str, Any]], Mapping[str, Any]]],
+    tasks: Optional[Sequence[str]],
+) -> list[str]:
+    if tasks is not None:
+        return [task for task in tasks]
+
+    available = set()
+    for _, _, results, _ in result_sets:
+        available.update(results)
+
+    ordered = [task for task in _DCLM_CORE_LM_EVAL_TASKS if task in available]
+    ordered.extend(sorted(available.difference(ordered)))
+    return ordered
+
+
+def _load_task_loss_run_metadata(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    candidates = []
+    run_dir = payload.get("run_dir")
+    if run_dir:
+        candidates.append(Path(str(run_dir)))
+    checkpoint = payload.get("checkpoint")
+    if checkpoint:
+        candidates.append(Path(str(checkpoint)).parent)
+
+    for run_path in candidates:
+        run_path = run_path.expanduser()
+        for filename in ("args.yaml", "spec.yaml"):
+            config_path = run_path / filename
+            if config_path.exists():
+                metadata = _load_yaml_mapping(config_path)
+                metadata["_config_path"] = str(config_path)
+                return metadata
+    return {}
+
+
+def _ordered_task_loss_tasks(
+    result_sets: Sequence[Tuple[str, Path, Mapping[str, Any], Mapping[str, Any]]],
+    tasks: Optional[Sequence[str]],
+) -> list[str]:
+    if tasks is not None:
+        return [task for task in tasks]
+
+    ordered = []
+    seen = set()
+    for _, _, payload, _ in result_sets:
+        for task in payload.get("tasks", ()) or ():
+            if task not in seen:
+                ordered.append(task)
+                seen.add(task)
+
+        results = payload.get("results", {})
+        if isinstance(results, Mapping):
+            for task in results:
+                if task not in seen:
+                    ordered.append(task)
+                    seen.add(task)
+    return ordered
+
+
+def _numeric_task_metric(metrics: Mapping[str, Any], key: str) -> float:
+    value = metrics.get(key)
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    return float("nan")
+
+
+def _maybe_round(value: float, decimals: Optional[int]) -> float:
+    if decimals is None or not math.isfinite(value):
+        return value
+    return round(value, decimals)
+
+
+def make_task_loss_results_table(
+    results_root: Union[str, Path, Sequence[Union[str, Path]]] = _DEFAULT_TASK_LOSS_RESULTS_ROOTS,
+    *,
+    result_filename: str = "task_loss_results.yaml",
     run_paths: Optional[Sequence[Union[str, Path]]] = None,
     run_labels: Optional[Mapping[str, str]] = None,
-    benchmark_specs: Optional[Sequence[Mapping[str, Any]]] = None,
-    metric_preferences: Sequence[str] = (
-        "acc_norm,none",
-        "acc,none",
-        "exact_match,none",
-        "f1,none",
-        "mcc,none",
-    ),
-    decimals: int = 2,
-    percent: bool = True,
-    show_stderr: bool = True,
-    show_mean_stderr: bool = False,
-    pm_symbol: str = "+/-",
+    recursive: bool = True,
+    layout: str = "wide",
+    tasks: Optional[Sequence[str]] = None,
+    task_labels: Optional[Mapping[str, str]] = None,
+    value_key: str = "task_loss",
+    include_metadata: bool = True,
+    metadata_keys: Sequence[str] = _DEFAULT_TASK_LOSS_METADATA_KEYS,
+    include_mean: bool = True,
     include_missing: bool = False,
+    decimals: Optional[int] = None,
     output_path: Optional[Union[str, Path]] = None,
 ):
     """
-    Build a paper-style summary table from lm-eval result directories.
+    Build a pandas table from saved task-loss result directories.
 
-    The default scans `/e/scratch/reformo/shechter1/lm_eval_results` for
-    `*/lm_eval_results.yaml`, which currently matches the three eval runs. The
-    function reads only the top-level `results:` block, avoiding the large
-    `samples:` block emitted by lm-eval.
+    By default this scans the two current task-loss result folders:
+    `/e/project1/laionize/shechter1/task_loss_results/26-05-14-baselines`
+    and
+    `/e/project1/laionize/shechter1/task_loss_results/26-05-15-centered_fsq`.
 
-    Scores are displayed as percentages with standard error when lm-eval reports
-    one. Multi-subtask benchmarks such as GLUE or BLiMP are averaged across
-    available subtasks and get a combined standard error when possible.
+    `layout="wide"` returns one row per run and one column per task. Use
+    `layout="long"` for one row per `(run, task)` with task counts included.
 
     Args:
         results_root:
-            Directory containing one subdirectory per run.
+            Result root, result file, or sequence of roots/files.
         result_filename:
             Result YAML filename inside each run directory.
         run_paths:
             Optional explicit result directories or YAML files. If omitted, all
-            matching subdirectories under results_root are used.
+            matching files under results_root are used.
         run_labels:
-            Optional mapping from run directory name to display label.
-        benchmark_specs:
-            Optional benchmark definitions. Each mapping should contain `label`
-            and either `tasks` or `prefix`.
-        metric_preferences:
-            Fallback metric priority for tasks without a task-specific default.
+            Optional mapping from run id (`group/run`) or run directory name to
+            display label.
+        layout:
+            `"wide"` for run rows and task columns, or `"long"` for tidy rows.
+        tasks:
+            Optional task order. If omitted, task order is read from the result
+            files, preserving the first-seen order.
+        value_key:
+            Metric to place in task columns. Defaults to `task_loss`; `task_bpb`
+            also works with these result files.
+        include_metadata:
+            If true, read the matching checkpoint `args.yaml`/`spec.yaml` from
+            the `run_dir` recorded in each result file.
         output_path:
-            Optional `.tex`, `.csv`, or `.md` path to write the formatted table.
+            Optional `.tex`, `.csv`, or `.md` path to write the table.
 
     Returns:
-        pandas.DataFrame with formatted table cells. Raw numeric values are also
-        stored in `table.attrs["raw_scores"]`.
+        pandas.DataFrame. Raw numeric values are stored in
+        `table.attrs["raw_values"]`.
     """
     pd = _import_pandas()
-    results_root = Path(results_root)
-    specs = tuple(benchmark_specs or _DEFAULT_LM_EVAL_BENCHMARKS)
+    layout = layout.lower()
+    if layout in {"runs", "table"}:
+        layout = "wide"
+    if layout in {"tidy"}:
+        layout = "long"
+    if layout not in {"wide", "long"}:
+        raise ValueError("layout must be 'wide' or 'long'")
 
-    if run_paths is None:
-        paths = sorted(results_root.glob(f"*/{result_filename}"))
-    else:
-        paths = []
-        for run_path in run_paths:
-            path = Path(run_path)
-            if path.is_dir():
-                path = path / result_filename
-            paths.append(path)
+    paths = _collect_lm_eval_result_paths(
+        results_root,
+        result_filename=result_filename,
+        run_paths=run_paths,
+        recursive=recursive,
+    )
 
     if not paths:
         raise FileNotFoundError(
@@ -649,87 +968,474 @@ def make_lm_eval_results_table(
         )
 
     run_labels = dict(run_labels or {})
-    result_sets: list[Tuple[str, Dict[str, Dict[str, Any]]]] = []
+    result_sets: list[Tuple[str, Path, Dict[str, Any], Dict[str, Any]]] = []
     for path in paths:
-        run_name = path.parent.name
-        label = run_labels.get(run_name, _pretty_lm_eval_run_label(run_name))
-        result_sets.append((label, _load_lm_eval_results_block(path)))
+        payload = _load_yaml_mapping(path)
+        results = payload.get("results", {})
+        if not isinstance(results, Mapping):
+            raise ValueError(f"Expected a mapping under results in {path}")
+        metadata = _load_task_loss_run_metadata(payload) if include_metadata else {}
+        result_sets.append((_lm_eval_run_id(path), path, payload, metadata))
 
-    rows: list[Dict[str, str]] = []
-    raw_scores: Dict[str, Dict[str, Tuple[Optional[float], Optional[float]]]] = {}
+    result_sets = sorted(result_sets, key=lambda item: _natural_sort_key(item[0]))
+    task_names = _ordered_task_loss_tasks(result_sets, tasks)
+    task_labels = dict(task_labels or {})
+    raw_values: Dict[str, Dict[str, float]] = {}
 
-    for spec in specs:
-        benchmark_key = str(spec.get("key", spec.get("label", "benchmark")))
-        benchmark_label = str(spec["label"])
-        row: Dict[str, str] = {"Benchmark": benchmark_label}
-        raw_scores[benchmark_key] = {}
-        has_any_score = False
+    def base_row(
+        run_id: str,
+        path: Path,
+        payload: Mapping[str, Any],
+        metadata: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        group_name, run_name = _lm_eval_result_group_and_run(path)
+        row: Dict[str, Any] = {
+            "group": group_name,
+            "run": run_name,
+            "run_id": run_id,
+            "label": (
+                run_labels.get(run_id)
+                or run_labels.get(run_name)
+                or metadata.get("config_label")
+                or run_id
+            ),
+        }
+        if "checkpoint_step" in payload:
+            row["checkpoint_step"] = payload["checkpoint_step"]
+        if include_metadata:
+            for key in metadata_keys:
+                if key in metadata and key not in row:
+                    row[key] = _format_lm_eval_metadata_value(metadata[key])
+        return row
 
-        for run_label, results in result_sets:
-            task_names = _lm_eval_tasks_for_spec(results, spec)
-            if not task_names:
-                value = None
-                stderr = None
-            else:
-                values = []
-                stderrs = []
-                for task_name in task_names:
-                    value_i, stderr_i = _select_lm_eval_metric(
+    rows: list[Dict[str, Any]] = []
+    if layout == "wide":
+        mean_column = f"mean_{value_key}"
+        for run_id, path, payload, metadata in result_sets:
+            row = base_row(run_id, path, payload, metadata)
+            results = payload["results"]
+            raw_values[run_id] = {}
+            mean_values = []
+            for task_name in task_names:
+                metrics = results.get(task_name, {})
+                value = (
+                    _numeric_task_metric(metrics, value_key)
+                    if isinstance(metrics, Mapping)
+                    else float("nan")
+                )
+                raw_values[run_id][task_name] = value
+                if math.isfinite(value):
+                    mean_values.append(value)
+                row[task_labels.get(task_name, task_name)] = _maybe_round(value, decimals)
+
+            if include_mean:
+                mean_value = float(np.mean(mean_values)) if mean_values else float("nan")
+                raw_values[run_id]["mean"] = mean_value
+                row[mean_column] = _maybe_round(mean_value, decimals)
+            rows.append(row)
+
+        front_columns = [
+            column
+            for column in [
+                "group",
+                "run",
+                "run_id",
+                "label",
+                "checkpoint_step",
+                *metadata_keys,
+                mean_column,
+            ]
+            if any(column in row for row in rows)
+        ]
+        task_columns = [task_labels.get(task_name, task_name) for task_name in task_names]
+        ordered_columns = front_columns + [
+            column for column in task_columns if column not in front_columns
+        ]
+    else:
+        for run_id, path, payload, metadata in result_sets:
+            results = payload["results"]
+            raw_values[run_id] = {}
+            for task_name in task_names:
+                metrics = results.get(task_name, {})
+                if not metrics and not include_missing:
+                    continue
+                if not isinstance(metrics, Mapping):
+                    metrics = {}
+
+                value = _numeric_task_metric(metrics, value_key)
+                raw_values[run_id][task_name] = value
+                row = base_row(run_id, path, payload, metadata)
+                row["task"] = task_name
+                row[value_key] = _maybe_round(value, decimals)
+                for key in ("task_bpb", "n_examples", "n_tokens", "answer_bytes"):
+                    if key in metrics and key != value_key:
+                        row[key] = metrics[key]
+                rows.append(row)
+
+        front_columns = [
+            column
+            for column in [
+                "group",
+                "run",
+                "run_id",
+                "label",
+                "checkpoint_step",
+                *metadata_keys,
+                "task",
+                value_key,
+                "task_bpb",
+                "n_examples",
+                "n_tokens",
+                "answer_bytes",
+            ]
+            if any(column in row for row in rows)
+        ]
+        ordered_columns = front_columns
+
+    table = pd.DataFrame(rows)
+    table = table.reindex(columns=ordered_columns)
+    table.attrs["raw_values"] = raw_values
+    table.attrs["result_paths"] = [str(path) for _, path, _, _ in result_sets]
+    table.attrs["tasks"] = task_names
+    table.attrs["value_key"] = value_key
+
+    if output_path is not None:
+        output_path = Path(output_path)
+        suffix = output_path.suffix.lower()
+        if suffix == ".tex":
+            output = table.to_latex(index=False, escape=False)
+        elif suffix == ".csv":
+            output = table.to_csv(index=False)
+        elif suffix in {".md", ".markdown"}:
+            output = table.to_markdown(index=False)
+        else:
+            output = table.to_string(index=False)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(output, encoding="utf-8")
+
+    return table
+
+
+def make_lm_eval_results_table(
+    results_root: Union[str, Path, Sequence[Union[str, Path]]] = "/e/project1/laionize/shechter1/lm_eval_results",
+    *,
+    result_filename: str = "lm_eval_results.yaml",
+    run_paths: Optional[Sequence[Union[str, Path]]] = None,
+    run_labels: Optional[Mapping[str, str]] = None,
+    checkpoint_roots: Union[str, Path, Sequence[Union[str, Path]], None] = None,
+    recursive: bool = True,
+    layout: str = "runs",
+    tasks: Optional[Sequence[str]] = None,
+    task_labels: Optional[Mapping[str, str]] = None,
+    include_metadata: bool = True,
+    metadata_keys: Sequence[str] = _DEFAULT_LM_EVAL_METADATA_KEYS,
+    benchmark_specs: Optional[Sequence[Mapping[str, Any]]] = None,
+    metric_preferences: Sequence[str] = (
+        "acc_norm,none",
+        "acc,none",
+        "f1,none",
+        "exact_match,none",
+        "em,none",
+        "exact,none",
+        "mcc,none",
+    ),
+    decimals: int = 2,
+    percent: bool = True,
+    show_stderr: bool = False,
+    show_mean_stderr: bool = False,
+    pm_symbol: str = "+/-",
+    format_scores: bool = True,
+    include_missing: bool = False,
+    output_path: Optional[Union[str, Path]] = None,
+):
+    """
+    Build a pandas table from lm-eval result directories.
+
+    The default recursively scans
+    `/e/project1/laionize/shechter1/lm_eval_results` for
+    `lm_eval_results.yaml`. The reader only loads the top-level `results:`
+    block, avoiding the large `samples:` block emitted by lm-eval.
+
+    `layout="runs"` returns one row per run and one column per task, which is
+    the useful shape for sweeps with many tasks. `layout="benchmarks"` keeps the
+    older paper-style view with benchmark rows and run columns.
+
+    Args:
+        results_root:
+            Result root, result file, or sequence of roots/files.
+        result_filename:
+            Result YAML filename inside each run directory.
+        run_paths:
+            Optional explicit result directories or YAML files. If omitted, all
+            matching files under results_root are used.
+        run_labels:
+            Optional mapping from run id (`group/run`) or run directory name to
+            display label.
+        checkpoint_roots:
+            Optional checkpoint roots used to find matching `args.yaml` metadata.
+            For these runs, pass
+            `/e/project1/laionize/shechter1/checkpoints/modded-nanogpt-moe`.
+        layout:
+            `"runs"` for run rows and task columns, or `"benchmarks"` for the
+            older benchmark-summary layout.
+        tasks:
+            Optional task order for `layout="runs"`. If omitted, DCLM-core tasks
+            are ordered first, followed by any extra tasks in sorted order.
+        benchmark_specs:
+            Optional benchmark definitions for `layout="benchmarks"`. Each
+            mapping should contain `label` and either `tasks` or `prefix`.
+        metric_preferences:
+            Fallback metric priority for tasks without a task-specific default.
+        format_scores:
+            If true, score cells are formatted strings such as `45.52%`. If
+            false and `show_stderr` is false, score cells are numeric.
+        output_path:
+            Optional `.tex`, `.csv`, or `.md` path to write the formatted table.
+
+    Returns:
+        pandas.DataFrame. Raw normalized scores in `[0, 1]` are stored in
+        `table.attrs["raw_scores"]`, and selected metric keys are stored in
+        `table.attrs["selected_metrics"]`.
+    """
+    pd = _import_pandas()
+    layout = layout.lower()
+    if layout in {"paper", "benchmark", "summary"}:
+        layout = "benchmarks"
+    if layout not in {"runs", "wide", "benchmarks"}:
+        raise ValueError("layout must be 'runs' or 'benchmarks'")
+
+    paths = _collect_lm_eval_result_paths(
+        results_root,
+        result_filename=result_filename,
+        run_paths=run_paths,
+        recursive=recursive,
+    )
+
+    if not paths:
+        raise FileNotFoundError(
+            f"No {result_filename} files found under {results_root}"
+        )
+
+    run_labels = dict(run_labels or {})
+    checkpoint_root_paths = _as_path_list(checkpoint_roots)
+    result_sets: list[Tuple[str, Path, Dict[str, Dict[str, Any]], Dict[str, Any]]] = []
+    for path in paths:
+        run_id = _lm_eval_run_id(path)
+        metadata = (
+            _load_lm_eval_run_metadata(path, checkpoint_root_paths)
+            if checkpoint_root_paths and include_metadata
+            else {}
+        )
+        result_sets.append((run_id, path, _load_lm_eval_results_block(path), metadata))
+
+    found_run_ids = {run_id for run_id, _, _, _ in result_sets}
+    found_groups = {run_id.split("/", 1)[0] for run_id in found_run_ids if "/" in run_id}
+    missing_run_ids: list[str] = []
+    if include_missing and checkpoint_root_paths:
+        done_run_dirs = _collect_done_checkpoint_run_dirs(checkpoint_root_paths)
+        for run_id, run_dir in sorted(done_run_dirs.items(), key=lambda item: _natural_sort_key(item[0])):
+            if run_id in found_run_ids:
+                continue
+            group_name = run_id.split("/", 1)[0] if "/" in run_id else ""
+            if found_groups and group_name not in found_groups:
+                continue
+            synthetic_path = run_dir / result_filename
+            metadata_path = run_dir / "args.yaml"
+            if not metadata_path.exists():
+                metadata_path = run_dir / "spec.yaml"
+            metadata = _load_yaml_mapping(metadata_path) if metadata_path.exists() else {}
+            if metadata:
+                metadata["_config_path"] = str(metadata_path)
+            result_sets.append((run_id, synthetic_path, {}, metadata))
+            missing_run_ids.append(run_id)
+
+    result_sets = sorted(result_sets, key=lambda item: _natural_sort_key(item[0]))
+
+    if layout in {"runs", "wide"}:
+        task_names = _ordered_lm_eval_tasks(result_sets, tasks)
+        task_labels = dict(task_labels or {})
+        rows: list[Dict[str, Any]] = []
+        raw_scores: Dict[str, Dict[str, Tuple[Optional[float], Optional[float]]]] = {}
+        selected_metrics: Dict[str, Dict[str, str]] = {}
+
+        for run_id, path, results, metadata in result_sets:
+            group_name, run_name = _lm_eval_result_group_and_run(path)
+            label = (
+                run_labels.get(run_id)
+                or run_labels.get(run_name)
+                or metadata.get("config_label")
+                or _pretty_lm_eval_run_label(run_id)
+            )
+            row: Dict[str, Any] = {
+                "group": group_name,
+                "run": run_name,
+                "run_id": run_id,
+                "label": label,
+            }
+            if include_metadata:
+                for key in metadata_keys:
+                    if key in metadata and key not in row:
+                        row[key] = _format_lm_eval_metadata_value(metadata[key])
+
+            raw_scores[run_id] = {}
+            selected_metrics[run_id] = {}
+            mean_values = []
+            mean_stderrs = []
+            for task_name in task_names:
+                column = task_labels.get(task_name, task_name)
+                if task_name not in results:
+                    value = None
+                    stderr = None
+                else:
+                    value, stderr, metric_key = _select_lm_eval_metric_with_key(
                         task_name,
                         results[task_name],
                         metric_preferences,
                     )
-                    values.append(value_i)
-                    stderrs.append(stderr_i)
-                value, stderr = _combine_lm_eval_scores(values, stderrs)
-                has_any_score = True
+                    selected_metrics[run_id][task_name] = metric_key
+                    mean_values.append(value)
+                    mean_stderrs.append(stderr)
 
-            raw_scores[benchmark_key][run_label] = (value, stderr)
-            column = f"{run_label} {pm_symbol} stderr"
-            row[column] = _format_lm_eval_score(
+                raw_scores[run_id][task_name] = (value, stderr)
+                row[column] = _lm_eval_score_cell(
+                    value,
+                    stderr,
+                    decimals=decimals,
+                    percent=percent,
+                    show_stderr=show_stderr,
+                    pm_symbol=pm_symbol,
+                    format_scores=format_scores,
+                )
+
+            if mean_values:
+                mean_value, mean_stderr = _combine_lm_eval_scores(mean_values, mean_stderrs)
+            else:
+                mean_value = None
+                mean_stderr = None
+            raw_scores[run_id]["mean"] = (mean_value, mean_stderr)
+            row["mean"] = _lm_eval_score_cell(
+                mean_value,
+                mean_stderr,
+                decimals=decimals,
+                percent=percent,
+                show_stderr=show_mean_stderr,
+                pm_symbol=pm_symbol,
+                format_scores=format_scores,
+            )
+
+            rows.append(row)
+
+        front_columns = [
+            column
+            for column in ["group", "run", "run_id", "label", *metadata_keys, "mean"]
+            if any(column in row for row in rows)
+        ]
+        score_columns = [task_labels.get(task_name, task_name) for task_name in task_names]
+        ordered_columns = front_columns + [
+            column for column in score_columns if column not in front_columns
+        ]
+        table = pd.DataFrame(rows)
+        table = table.reindex(columns=ordered_columns)
+        table.attrs["raw_scores"] = raw_scores
+        table.attrs["selected_metrics"] = selected_metrics
+        table.attrs["result_paths"] = [str(path) for _, path, results, _ in result_sets if results]
+        table.attrs["missing_run_ids"] = missing_run_ids
+    else:
+        specs = tuple(benchmark_specs or _DEFAULT_LM_EVAL_BENCHMARKS)
+        rows: list[Dict[str, Any]] = []
+        raw_scores: Dict[str, Dict[str, Tuple[Optional[float], Optional[float]]]] = {}
+
+        for spec in specs:
+            benchmark_key = str(spec.get("key", spec.get("label", "benchmark")))
+            benchmark_label = str(spec["label"])
+            row: Dict[str, Any] = {"Benchmark": benchmark_label}
+            raw_scores[benchmark_key] = {}
+            has_any_score = False
+
+            for run_id, path, results, metadata in result_sets:
+                run_name = path.parent.name
+                run_label = (
+                    run_labels.get(run_id)
+                    or run_labels.get(run_name)
+                    or metadata.get("config_label")
+                    or _pretty_lm_eval_run_label(run_id)
+                )
+                task_names = _lm_eval_tasks_for_spec(results, spec)
+                if not task_names:
+                    value = None
+                    stderr = None
+                else:
+                    values = []
+                    stderrs = []
+                    for task_name in task_names:
+                        value_i, stderr_i = _select_lm_eval_metric(
+                            task_name,
+                            results[task_name],
+                            metric_preferences,
+                        )
+                        values.append(value_i)
+                        stderrs.append(stderr_i)
+                    value, stderr = _combine_lm_eval_scores(values, stderrs)
+                    has_any_score = True
+
+                raw_scores[benchmark_key][run_label] = (value, stderr)
+                column = f"{run_label} {pm_symbol} stderr" if show_stderr else run_label
+                row[column] = _lm_eval_score_cell(
+                    value,
+                    stderr,
+                    decimals=decimals,
+                    percent=percent,
+                    show_stderr=show_stderr,
+                    pm_symbol=pm_symbol,
+                    format_scores=format_scores,
+                )
+
+            if has_any_score or include_missing:
+                rows.append(row)
+
+        mean_row: Dict[str, Any] = {"Benchmark": "mean"}
+        raw_scores["mean"] = {}
+        benchmark_keys = [str(spec.get("key", spec.get("label", "benchmark"))) for spec in specs]
+        for run_id, path, _, metadata in result_sets:
+            run_name = path.parent.name
+            run_label = (
+                run_labels.get(run_id)
+                or run_labels.get(run_name)
+                or metadata.get("config_label")
+                or _pretty_lm_eval_run_label(run_id)
+            )
+            values = []
+            stderrs = []
+            for benchmark_key in benchmark_keys:
+                score = raw_scores.get(benchmark_key, {}).get(run_label)
+                if score is None or score[0] is None:
+                    continue
+                values.append(float(score[0]))
+                stderrs.append(score[1])
+
+            if values:
+                value, stderr = _combine_lm_eval_scores(values, stderrs)
+            else:
+                value = None
+                stderr = None
+            raw_scores["mean"][run_label] = (value, stderr)
+            column = f"{run_label} {pm_symbol} stderr" if show_mean_stderr else run_label
+            mean_row[column] = _lm_eval_score_cell(
                 value,
                 stderr,
                 decimals=decimals,
                 percent=percent,
-                show_stderr=show_stderr,
+                show_stderr=show_mean_stderr,
                 pm_symbol=pm_symbol,
+                format_scores=format_scores,
             )
+        rows.append(mean_row)
 
-        if has_any_score or include_missing:
-            rows.append(row)
-
-    mean_row: Dict[str, str] = {"Benchmark": "mean"}
-    raw_scores["mean"] = {}
-    benchmark_keys = [str(spec.get("key", spec.get("label", "benchmark"))) for spec in specs]
-    for run_label, _ in result_sets:
-        values = []
-        stderrs = []
-        for benchmark_key in benchmark_keys:
-            score = raw_scores.get(benchmark_key, {}).get(run_label)
-            if score is None or score[0] is None:
-                continue
-            values.append(float(score[0]))
-            stderrs.append(score[1])
-
-        if values:
-            value, stderr = _combine_lm_eval_scores(values, stderrs)
-        else:
-            value = None
-            stderr = None
-        raw_scores["mean"][run_label] = (value, stderr)
-        column = f"{run_label} {pm_symbol} stderr"
-        mean_row[column] = _format_lm_eval_score(
-            value,
-            stderr,
-            decimals=decimals,
-            percent=percent,
-            show_stderr=show_mean_stderr,
-            pm_symbol=pm_symbol,
-        )
-    rows.append(mean_row)
-
-    table = pd.DataFrame(rows)
-    table.attrs["raw_scores"] = raw_scores
+        table = pd.DataFrame(rows)
+        table.attrs["raw_scores"] = raw_scores
+        table.attrs["selected_metrics"] = {}
+        table.attrs["result_paths"] = [str(path) for _, path, results, _ in result_sets if results]
+        table.attrs["missing_run_ids"] = missing_run_ids if include_missing else []
 
     if output_path is not None:
         output_path = Path(output_path)
